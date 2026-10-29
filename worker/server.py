@@ -28,6 +28,7 @@ NANO_MODEL = os.environ.get("NANO_MODEL", "FunAudioLLM/Fun-ASR-Nano-2512")
 # Fun-ASR 官方仓库（https://github.com/FunAudioLLM/Fun-ASR），Nano 的模型代码 model.py 在仓库根目录，setup.sh 负责 clone
 FUN_ASR_DIR = os.environ.get("FUN_ASR_DIR", "/root/autodl-tmp/Fun-ASR")
 NANO_LANG = {"zh": "中文", "en": "英文", "ja": "日文"}
+NANO_MAX_SEG_MS = 30000  # VAD 单段最长 30 秒（官方长音频示例的取值）
 PRELOAD_SPK = os.environ.get("PRELOAD_SPK", "1") == "1"
 
 _models: dict[str, object] = {}
@@ -54,14 +55,17 @@ def _load(key: str):
             m = AutoModel(model="iic/SenseVoiceSmall", vad_model="fsmn-vad",
                           vad_kwargs={"max_single_segment_time": 30000}, **common)
         elif key == "nano":
-            # 官方用法：trust_remote_code + remote_code 指向 Fun-ASR 仓库的 model.py；长音频配 fsmn-vad 分段
+            # 官方用法：trust_remote_code + remote_code 指向 Fun-ASR 仓库的 model.py。
+            # 不挂 vad_model：FunASR 内置 VAD 把切好的段以 tensor 传给 model.py，它的 data_load_speech
+            # 处理不了（UnboundLocalError: data_src），所以分段由 transcribe_nano 自己做、按文件路径逐段送。
             code = os.path.join(FUN_ASR_DIR, "model.py")
             if not os.path.exists(code):
                 raise RuntimeError(f"缺少 {code}，请先执行 bash worker/setup.sh（会 clone Fun-ASR 仓库）")
             if FUN_ASR_DIR not in sys.path:
                 sys.path.insert(0, FUN_ASR_DIR)  # model.py 会 import 同目录下的其他模块
-            m = AutoModel(model=NANO_MODEL, trust_remote_code=True, remote_code=code, vad_model="fsmn-vad",
-                          vad_kwargs={"max_single_segment_time": 30000}, **common)
+            m = AutoModel(model=NANO_MODEL, trust_remote_code=True, remote_code=code, **common)
+        elif key == "vad":
+            m = AutoModel(model="fsmn-vad", max_single_segment_time=NANO_MAX_SEG_MS, **common)
         else:
             raise KeyError(key)
         _models[key] = m
@@ -115,19 +119,17 @@ def _run(model_name: str, spk: bool, path: str, hotwords: str, lang: str = "zh")
         sents, no_ts = sentences_from_sensevoice(res)
         return make_result("asr_remote", "sensevoice", 0, sents, no_ts)
     if key == "nano":
-        res = m.generate(**nano_kwargs(path, hot, lang))
-        sents, no_ts = sentences_from_nano(res)
-        return make_result("asr_remote", "fun-asr-nano", 0, sents, no_ts)
+        sents = transcribe_nano(m, path, hot, lang)
+        return make_result("asr_remote", "fun-asr-nano", 0, sents, False)
     res = m.generate(hotword=hot or None, sentence_timestamp=True, **kwargs)
     sents, no_ts = sentences_from_funasr(res)
     return make_result("asr_remote", "paraformer-zh", 0, sents, no_ts)
 
 
 def nano_kwargs(path: str, hot: str, lang: str) -> dict:
-    """Fun-ASR-Nano 的 generate 参数（官方示例：cache={}、batch_size=1、hotwords 列表、language、itn）。
-    Nano 不支持批量解码（model.py: batch decoding is not implemented），VAD 切出的段要一段一段送：
-    batch_size_s=1 让每批只装一段（每段都长于 1 秒）。"""
-    kw = {"input": [path], "cache": {}, "batch_size": 1, "batch_size_s": 1, "itn": True}
+    """Fun-ASR-Nano 单段的 generate 参数（官方示例：input 为路径列表、cache={}、batch_size=1、hotwords、language、itn）。
+    Nano 不支持批量解码（model.py: batch decoding is not implemented）。"""
+    kw = {"input": [path], "cache": {}, "batch_size": 1, "itn": True}
     if hot:
         kw["hotwords"] = hot.split()
     if lang in NANO_LANG:
@@ -135,15 +137,31 @@ def nano_kwargs(path: str, hot: str, lang: str) -> dict:
     return kw
 
 
-def sentences_from_nano(res) -> tuple[list[dict], bool]:
-    """Nano 输出 → 句子。优先用 sentence_info；没有就每段一句；都没有时间就整段文本。
-    真实输出结构以 worker/test_nano.py 在 GPU 上的结果为准。"""
-    sents, no_ts = sentences_from_funasr(res)
-    if not no_ts:
-        return sents, False
-    items = res if isinstance(res, list) else [res or {}]
-    texts = [str(r.get("text", "")).strip() for r in items if r.get("text")]
-    return ([{"start": 0, "end": 0, "text": "".join(texts)}] if texts else []), True
+def vad_segments(path: str) -> list[list[int]]:
+    """fsmn-vad 切分，返回 [[起点ms, 终点ms], ...]。"""
+    res = _load("vad").generate(input=path)
+    return [[int(b), int(e)] for b, e in (res[0].get("value") or []) if e > b]
+
+
+def transcribe_nano(m, path: str, hot: str, lang: str, on_raw=None) -> list[dict]:
+    """自己做 VAD，把每段写成临时 wav 按路径逐段送 Nano；每段的 VAD 起止就是这一句的时间戳。"""
+    import soundfile as sf
+    from funasr.utils.load_utils import load_audio_text_image_video
+
+    audio = load_audio_text_image_video(path, fs=16000)
+    audio = audio.numpy() if hasattr(audio, "numpy") else audio
+    sents = []
+    with tempfile.TemporaryDirectory() as tmp:
+        for i, (beg, end) in enumerate(vad_segments(path)):
+            seg = os.path.join(tmp, f"{i}.wav")
+            sf.write(seg, audio[beg * 16:end * 16], 16000)
+            res = m.generate(**nano_kwargs(seg, hot, lang))
+            if on_raw and i == 0:
+                on_raw(res)
+            text = str((res[0] if res else {}).get("text", "")).strip()
+            if text:
+                sents.append({"start": beg, "end": end, "text": text})
+    return sents
 
 
 @app.post("/transcribe")

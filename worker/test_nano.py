@@ -36,19 +36,22 @@ def main():
     m = server._load("nano")
     print(f"加载用时 {time.time() - t0:.1f}s")
 
+    segs = server.vad_segments(wav)
+    print(f"VAD 切出 {len(segs)} 段：{short(segs)}")
+
+    def show_raw(res):
+        items = res if isinstance(res, list) else [res]
+        print(f"第 1 段原始输出：{len(items)} 项")
+        for it in items[:1]:
+            print(f"  字段：{list(it.keys()) if isinstance(it, dict) else type(it)}")
+            if isinstance(it, dict):
+                for k, v in it.items():
+                    print(f"  {k}: {short(v)}")
+
     t0 = time.time()
-    res = m.generate(**server.nano_kwargs(wav, "", "zh"))
-    print(f"识别用时 {time.time() - t0:.1f}s")
-    items = res if isinstance(res, list) else [res]
-    print(f"返回 {len(items)} 项")
-    for i, it in enumerate(items[:3]):
-        print(f"--- 第 {i} 项，字段：{list(it.keys()) if isinstance(it, dict) else type(it)}")
-        if isinstance(it, dict):
-            for k, v in it.items():
-                print(f"  {k}: {short(v)}")
-    sents, no_ts = server.sentences_from_nano(res)
-    print(f"转换后 {len(sents)} 句，no_timestamp={no_ts}")
-    for s in sents[:3]:
+    sents = server.transcribe_nano(m, wav, "", "zh", on_raw=show_raw)
+    print(f"识别用时 {time.time() - t0:.1f}s，共 {len(sents)} 句")
+    for s in sents[:5]:
         print("  ", s)
 
 
