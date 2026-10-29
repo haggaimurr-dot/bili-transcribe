@@ -18,6 +18,8 @@ def test_cookie_file(tmp_env):
     assert settings.cookie_dict() == {"SESSDATA": "abc123SESS", "bili_jct": "jct"}
     pub = settings.public(settings.load())
     assert pub["sessdata"] == "****SESS" and pub["cookie_configured"]
+    settings.update({"buvid3": "ABCD-infoc"})
+    assert settings.cookie_dict()["buvid3"] == "ABCD-infoc"
 
 
 def test_masked_value_not_overwritten(tmp_env):

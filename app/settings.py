@@ -22,6 +22,7 @@ class Settings(BaseModel):
     sessdata: str = ""
     bili_jct: str = ""
     dedeuserid: str = ""
+    buvid3: str = ""  # 浏览器设备标识；B 站视频网页缺它会返回 412
     default_backend: str = "local"  # local | remote
     default_model: str = "paraformer-zh"
     default_spk: bool = False
@@ -74,10 +75,11 @@ def update(patch: dict) -> Settings:
                 continue
             data[k] = v
         new = Settings(**data)
-        cookie_changed = any(getattr(new, k) != getattr(cur, k) for k in ("sessdata", "bili_jct", "dedeuserid"))
+        cookie_changed = any(getattr(new, k) != getattr(cur, k)
+                             for k in ("sessdata", "bili_jct", "dedeuserid", "buvid3"))
         if cookie_changed:
             if new.sessdata:
-                write_cookie_file(new.sessdata, new.bili_jct, new.dedeuserid)
+                write_cookie_file(new.sessdata, new.bili_jct, new.dedeuserid, new.buvid3)
                 new.cookie_source = "sessdata"
             else:
                 COOKIES_PATH.unlink(missing_ok=True)
@@ -103,10 +105,11 @@ def update_rtf(kind: str, measured: float) -> None:
 
 # ---------------- Cookie ----------------
 
-def write_cookie_file(sessdata: str, bili_jct: str = "", dedeuserid: str = "") -> None:
+def write_cookie_file(sessdata: str, bili_jct: str = "", dedeuserid: str = "", buvid3: str = "") -> None:
     expiry = int(time.time()) + 180 * 86400
     lines = ["# Netscape HTTP Cookie File", "# 由 bili-transcribe 生成"]
-    for name, value in (("SESSDATA", sessdata), ("bili_jct", bili_jct), ("DedeUserID", dedeuserid)):
+    for name, value in (("SESSDATA", sessdata), ("bili_jct", bili_jct), ("DedeUserID", dedeuserid),
+                        ("buvid3", buvid3)):
         value = value.strip()
         if value:
             lines.append("\t".join([".bilibili.com", "TRUE", "/", "FALSE", str(expiry), name, value]))
@@ -139,7 +142,7 @@ def save_cookie_upload(text: str) -> None:
     with _lock:
         s = load()
         s.cookie_source = "file"
-        s.sessdata = s.bili_jct = s.dedeuserid = ""
+        s.sessdata = s.bili_jct = s.dedeuserid = s.buvid3 = ""
         save(s)
     _notify()
 
@@ -149,7 +152,7 @@ def clear_cookies() -> None:
     with _lock:
         s = load()
         s.cookie_source = "none"
-        s.sessdata = s.bili_jct = s.dedeuserid = ""
+        s.sessdata = s.bili_jct = s.dedeuserid = s.buvid3 = ""
         save(s)
     _notify()
 

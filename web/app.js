@@ -585,7 +585,7 @@ const SettingsView = {
       }
     }
     async function saveCookie() {
-      await save({ sessdata: s.value.sessdata, bili_jct: s.value.bili_jct, dedeuserid: s.value.dedeuserid }, "Cookie 已保存");
+      await save({ sessdata: s.value.sessdata, bili_jct: s.value.bili_jct, dedeuserid: s.value.dedeuserid, buvid3: s.value.buvid3 }, "Cookie 已保存");
       refreshLogin();
     }
     async function upload(e) {
@@ -642,6 +642,7 @@ const SettingsView = {
           <span class="muted" v-if="s.cookie_source === 'file'">来源：cookies.txt</span>
         </div>
         <div class="field"><span class="label">SESSDATA（必填）</span><input type="password" v-model="s.sessdata" autocomplete="off" placeholder="粘贴 SESSDATA"></div>
+        <div class="field"><span class="label">buvid3（必填，同一个 Cookie 列表里，缺了 B 站会返回 412）</span><input type="text" v-model="s.buvid3" autocomplete="off" placeholder="形如 XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXXinfoc"></div>
         <div class="row">
           <div class="field grow"><span class="label">bili_jct（可选）</span><input type="password" v-model="s.bili_jct" autocomplete="off"></div>
           <div class="field grow"><span class="label">DedeUserID（可选）</span><input type="text" v-model="s.dedeuserid" autocomplete="off"></div>
