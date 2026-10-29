@@ -3,8 +3,9 @@
 1. 在 AutoDL 租一台 GPU 容器（PyTorch 镜像即可），SSH 登录后：
 
    ```bash
+   source /etc/network_turbo   # AutoDL 学术加速，访问 GitHub 更快
    cd /root/autodl-tmp
-   git clone <你的仓库地址> bili-transcribe   # 或用 scp 上传整个目录
+   git clone https://github.com/haggaimurr-dot/bili-transcribe.git
    cd bili-transcribe
    bash worker/setup.sh     # 首次部署：装依赖、下载模型、生成 Token
    bash worker/run.sh       # 启动
