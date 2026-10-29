@@ -35,6 +35,7 @@ NANO_MAX_SEG_MS = 30000  # VAD 单段最长 30 秒（官方长音频示例的取
 # Nano 不支持批量解码，只能逐段跑；加载多份模型、多段并行来提速（每份约 3.5 GB 显存）
 NANO_REPLICAS = max(1, int(os.environ.get("NANO_REPLICAS", "3")))
 PRELOAD_SPK = os.environ.get("PRELOAD_SPK", "1") == "1"
+PRELOAD_NANO = os.environ.get("PRELOAD_NANO", "1") == "1"  # 启动时加载全部 Nano 副本（约 2～3 分钟），首个请求不用等
 
 _models: dict[str, object] = {}
 _model_lock = threading.Lock()
@@ -66,11 +67,18 @@ def _load(key: str):
             m = AutoModel(model="iic/SenseVoiceSmall", vad_model="fsmn-vad",
                           vad_kwargs={"max_single_segment_time": 30000}, **common)
         elif key == "nano":
-            # 先加载 1 份马上可用，其余副本后台陆续加载、加载好就进池
+            # 所有副本加载完才开始推理：transformers 加载 bf16 的 Qwen3 时会临时改进程全局的默认 dtype，
+            # 边加载边推理会让推理线程新建的张量变成 bf16，报 "mat1 and mat2 must have the same dtype"（问题 #021）
             m = _new_nano()
             _add_nano(m)
-            if NANO_REPLICAS > 1:
-                threading.Thread(target=_grow_nano_pool, daemon=True, name="nano-loader").start()
+            for i in range(1, NANO_REPLICAS):
+                try:
+                    _add_nano(_new_nano())
+                except Exception as e:  # noqa: BLE001  显存不够等情况：用已加载的副本继续跑
+                    _nano_count["error"] = f"第 {i + 1} 份 Nano 加载失败：{e}"
+                    print(_nano_count["error"], flush=True)
+                    break
+            print(f"Nano 副本已加载：{_nano_count['loaded']} 份", flush=True)
         elif key == "vad":
             m = AutoModel(model="fsmn-vad", max_single_segment_time=NANO_MAX_SEG_MS, **common)
         else:
@@ -101,17 +109,6 @@ def _add_nano(m) -> None:
     _nano_count["loaded"] += 1
 
 
-def _grow_nano_pool() -> None:
-    for _ in range(NANO_REPLICAS - 1):
-        try:
-            _add_nano(_new_nano())
-        except Exception as e:  # noqa: BLE001  显存不够等情况：用已加载的副本继续跑
-            _nano_count["error"] = f"第 {_nano_count['loaded'] + 1} 份 Nano 加载失败：{e}"
-            print(_nano_count["error"], flush=True)
-            return
-    print(f"Nano 副本已全部加载：{_nano_count['loaded']} 份", flush=True)
-
-
 def _model_key(model: str, spk: bool) -> str:
     if model == "fun-asr-nano":
         return "nano"
@@ -135,6 +132,9 @@ async def preload():
     await run_in_threadpool(_load, "paraformer")
     if PRELOAD_SPK:
         await run_in_threadpool(_load, "paraformer+spk")
+    if PRELOAD_NANO and os.path.exists(os.path.join(FUN_ASR_DIR, "model.py")):
+        await run_in_threadpool(_load, "vad")
+        await run_in_threadpool(_load, "nano")
 
 
 @app.get("/health")
