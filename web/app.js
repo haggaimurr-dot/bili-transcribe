@@ -18,9 +18,9 @@ const LANGS = [
 ];
 const LANG_LABEL = Object.fromEntries(LANGS);
 const FINAL = ["done", "failed", "cancelled"];
-// fun-asr-nano 在 worker 上缺 model.py，修好前不开放（见问题文档 #006/#014）
-const MODELS = { local: ["paraformer-zh"], remote: ["paraformer-zh"] };
-const MODEL_LABEL = { "paraformer-zh": "paraformer-zh（推荐）", "fun-asr-nano": "fun-asr-nano（实验性，首次加载要几分钟）" };
+// fun-asr-nano 只能在远程 GPU 上跑（需要 worker 上的 Fun-ASR model.py，见问题文档 #006）
+const MODELS = { local: ["paraformer-zh"], remote: ["paraformer-zh", "fun-asr-nano"] };
+const MODEL_LABEL = { "paraformer-zh": "paraformer-zh（推荐）", "fun-asr-nano": "fun-asr-nano（更准，首次加载约 1 分钟）" };
 const MEDIA_EXTS = [".mp4", ".mkv", ".flv", ".mov", ".avi", ".webm", ".m4s", ".ts",
   ".mp3", ".m4a", ".aac", ".wav", ".flac", ".ogg", ".opus", ".wma", ".amr"];
 

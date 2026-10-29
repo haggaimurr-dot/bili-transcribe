@@ -2,8 +2,7 @@ from .base import ASRBackend, ASROptions
 from .local import LocalASR
 from .remote import RemoteASR
 
-# fun-asr-nano 暂不开放：worker 上缺 model.py，推理会卡住或 500（问题文档 #006/#014）
-REMOTE_MODELS = ("paraformer-zh", "sensevoice")
+REMOTE_MODELS = ("paraformer-zh", "fun-asr-nano", "sensevoice")
 LANGS = ("auto", "zh", "en", "ja", "ko", "yue")
 
 

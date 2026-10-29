@@ -158,10 +158,45 @@ def transcribe_nano(m, path: str, hot: str, lang: str, on_raw=None) -> list[dict
             res = m.generate(**nano_kwargs(seg, hot, lang))
             if on_raw and i == 0:
                 on_raw(res)
-            text = str((res[0] if res else {}).get("text", "")).strip()
-            if text:
-                sents.append({"start": beg, "end": end, "text": text})
+            sents += nano_segment_sentences(res, beg, end)
     return sents
+
+
+def nano_segment_sentences(res, beg: int, end: int) -> list[dict]:
+    """一段 VAD 的 Nano 输出 → 句子。
+    有逐字 timestamps（秒，相对本段起点）就按标点/停顿细分（复用 SenseVoice 的切句逻辑）；没有就整段一句。"""
+    it = (res[0] if res else {}) or {}
+    text = str(it.get("text", "")).strip()
+    if not text:
+        return []
+    ts = [t for t in (it.get("timestamps") or []) if isinstance(t, dict) and "token" in t]
+    if ts:
+        item = {"text": text, "words": _attach_punct(text, [str(t["token"]) for t in ts]),
+                "timestamp": [[beg + int(float(t["start_time"]) * 1000), beg + int(float(t["end_time"]) * 1000)]
+                              for t in ts]}
+        sents, no_ts = sentences_from_sensevoice([item])
+        if sents and not no_ts:
+            return sents
+    return [{"start": beg, "end": end, "text": text}]
+
+
+_PUNCT = set("，。！？；、,.!?;:：")
+
+
+def _attach_punct(text: str, tokens: list[str]) -> list[str]:
+    """Nano 的 timestamps 只有文字 token；把紧跟其后的标点并进去，切句时才能识别句末。"""
+    out, pos = [], 0
+    for tok in tokens:
+        idx = text.find(tok, pos)
+        if idx < 0:
+            out.append(tok)
+            continue
+        j = idx + len(tok)
+        while j < len(text) and text[j] in _PUNCT:
+            j += 1
+        out.append(text[idx:j])
+        pos = j
+    return out
 
 
 @app.post("/transcribe")
