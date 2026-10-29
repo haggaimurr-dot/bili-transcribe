@@ -3,6 +3,7 @@
 用法（仓库根目录、激活 .venv-worker 后）：
     python worker/test_nano.py                 # 用 ModelScope 自带示例音频
     python worker/test_nano.py /path/to/a.wav  # 用自己的音频
+    python worker/test_nano.py /path/to/a.wav --wait-replicas  # 等所有副本加载完再测（测并行提速）
 """
 import glob
 import json
@@ -48,8 +49,13 @@ def main():
                 for k, v in it.items():
                     print(f"  {k}: {short(v)}")
 
+    if len(sys.argv) > 2 and sys.argv[2] == "--wait-replicas":
+        while server._nano_count["loaded"] < server.NANO_REPLICAS and not server._nano_count["error"]:
+            time.sleep(2)
+    print(f"Nano 副本：已加载 {server._nano_count['loaded']} / 目标 {server.NANO_REPLICAS}"
+          + (f"（{server._nano_count['error']}）" if server._nano_count["error"] else ""))
     t0 = time.time()
-    sents = server.transcribe_nano(m, wav, "", "zh", on_raw=show_raw)
+    sents = server.transcribe_nano(wav, "", "zh", on_raw=show_raw)
     print(f"识别用时 {time.time() - t0:.1f}s，共 {len(sents)} 句")
     for s in sents[:5]:
         print("  ", s)

@@ -33,3 +33,50 @@ def test_real_sample_without_punctuation():
 def test_empty():
     assert nano_segment_sentences([{"text": ""}], 0, 1000) == []
     assert nano_segment_sentences([], 0, 1000) == []
+
+
+def test_parallel_pool_keeps_order_and_returns_replicas(monkeypatch):
+    """多副本并行：结果按 VAD 顺序拼回、确实并发、每份模型同一时刻只被一个线程用、用完全部归还。"""
+    import queue
+    import threading
+    import time
+
+    import numpy as np
+    from funasr.utils import load_utils
+
+    from worker import server
+
+    segs = [[i * 1000, i * 1000 + 800] for i in range(12)]
+    monkeypatch.setattr(server, "vad_segments", lambda p: segs)
+    monkeypatch.setattr(server, "_load", lambda k: None)
+    monkeypatch.setattr(load_utils, "load_audio_text_image_video", lambda p, fs: np.zeros(16000 * 13, "float32"))
+    state = {"now": 0, "peak": 0}
+    lock = threading.Lock()
+
+    class Fake:
+        def __init__(self, name):
+            self.name, self.busy = name, False
+
+        def generate(self, **kw):
+            assert not self.busy, "同一份模型被两个线程同时使用"
+            self.busy = True
+            with lock:
+                state["now"] += 1
+                state["peak"] = max(state["peak"], state["now"])
+            time.sleep(0.05)
+            idx = int(kw["input"][0].rsplit("\\", 1)[-1].rsplit("/", 1)[-1].split(".")[0])
+            with lock:
+                state["now"] -= 1
+            self.busy = False
+            return [{"text": f"第{idx}段。"}]
+
+    pool = queue.Queue()
+    for i in range(3):
+        pool.put((Fake(i), None))
+    monkeypatch.setattr(server, "_nano_pool", pool)
+
+    sents = server.transcribe_nano("x.wav", "", "zh")
+    assert [s["text"] for s in sents] == [f"第{i}段。" for i in range(12)]
+    assert [s["start"] for s in sents] == [s[0] for s in segs]
+    assert state["peak"] >= 2  # 确实并行
+    assert pool.qsize() == 3  # 副本全部归还

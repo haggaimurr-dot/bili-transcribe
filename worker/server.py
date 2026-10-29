@@ -3,11 +3,14 @@
 启动：ASR_TOKEN=xxx uvicorn worker.server:app --host 127.0.0.1 --port 9000（在仓库根目录执行）
 """
 import asyncio
+import contextlib
 import os
+import queue
 import sys
 import tempfile
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -29,12 +32,20 @@ NANO_MODEL = os.environ.get("NANO_MODEL", "FunAudioLLM/Fun-ASR-Nano-2512")
 FUN_ASR_DIR = os.environ.get("FUN_ASR_DIR", "/root/autodl-tmp/Fun-ASR")
 NANO_LANG = {"zh": "中文", "en": "英文", "ja": "日文"}
 NANO_MAX_SEG_MS = 30000  # VAD 单段最长 30 秒（官方长音频示例的取值）
+# Nano 不支持批量解码，只能逐段跑；加载多份模型、多段并行来提速（每份约 3.5 GB 显存）
+NANO_REPLICAS = max(1, int(os.environ.get("NANO_REPLICAS", "3")))
 PRELOAD_SPK = os.environ.get("PRELOAD_SPK", "1") == "1"
 
 _models: dict[str, object] = {}
 _model_lock = threading.Lock()
 _gpu_lock = asyncio.Lock()
 _busy = {"value": False}
+
+# Nano 模型池：元素是 (模型, CUDA stream)；借出去用完再放回，保证一份模型同时只被一个线程用
+_nano_pool: "queue.Queue[tuple]" = queue.Queue()
+_nano_count = {"loaded": 0, "error": ""}
+_nano_build_lock = threading.Lock()
+_nano_executor = ThreadPoolExecutor(max_workers=NANO_REPLICAS, thread_name_prefix="nano")
 
 
 def _load(key: str):
@@ -55,21 +66,50 @@ def _load(key: str):
             m = AutoModel(model="iic/SenseVoiceSmall", vad_model="fsmn-vad",
                           vad_kwargs={"max_single_segment_time": 30000}, **common)
         elif key == "nano":
-            # 官方用法：trust_remote_code + remote_code 指向 Fun-ASR 仓库的 model.py。
-            # 不挂 vad_model：FunASR 内置 VAD 把切好的段以 tensor 传给 model.py，它的 data_load_speech
-            # 处理不了（UnboundLocalError: data_src），所以分段由 transcribe_nano 自己做、按文件路径逐段送。
-            code = os.path.join(FUN_ASR_DIR, "model.py")
-            if not os.path.exists(code):
-                raise RuntimeError(f"缺少 {code}，请先执行 bash worker/setup.sh（会 clone Fun-ASR 仓库）")
-            if FUN_ASR_DIR not in sys.path:
-                sys.path.insert(0, FUN_ASR_DIR)  # model.py 会 import 同目录下的其他模块
-            m = AutoModel(model=NANO_MODEL, trust_remote_code=True, remote_code=code, **common)
+            # 先加载 1 份马上可用，其余副本后台陆续加载、加载好就进池
+            m = _new_nano()
+            _add_nano(m)
+            if NANO_REPLICAS > 1:
+                threading.Thread(target=_grow_nano_pool, daemon=True, name="nano-loader").start()
         elif key == "vad":
             m = AutoModel(model="fsmn-vad", max_single_segment_time=NANO_MAX_SEG_MS, **common)
         else:
             raise KeyError(key)
         _models[key] = m
         return m
+
+
+def _new_nano():
+    """加载一份 Fun-ASR-Nano。官方用法：trust_remote_code + remote_code 指向 Fun-ASR 仓库的 model.py。
+    不挂 vad_model：FunASR 内置 VAD 把切好的段以 tensor 传给 model.py，它的 data_load_speech
+    处理不了（UnboundLocalError: data_src），所以分段由 transcribe_nano 自己做、按文件路径逐段送。"""
+    from funasr import AutoModel
+
+    code = os.path.join(FUN_ASR_DIR, "model.py")
+    if not os.path.exists(code):
+        raise RuntimeError(f"缺少 {code}，请先执行 bash worker/setup.sh（会 clone Fun-ASR 仓库）")
+    with _nano_build_lock:
+        if FUN_ASR_DIR not in sys.path:
+            sys.path.insert(0, FUN_ASR_DIR)  # model.py 会 import 同目录下的其他模块
+        return AutoModel(model=NANO_MODEL, trust_remote_code=True, remote_code=code, device=DEVICE,
+                         disable_update=True, disable_pbar=True, log_level="ERROR")
+
+
+def _add_nano(m) -> None:
+    stream = torch.cuda.Stream() if DEVICE.startswith("cuda") else None
+    _nano_pool.put((m, stream))
+    _nano_count["loaded"] += 1
+
+
+def _grow_nano_pool() -> None:
+    for _ in range(NANO_REPLICAS - 1):
+        try:
+            _add_nano(_new_nano())
+        except Exception as e:  # noqa: BLE001  显存不够等情况：用已加载的副本继续跑
+            _nano_count["error"] = f"第 {_nano_count['loaded'] + 1} 份 Nano 加载失败：{e}"
+            print(_nano_count["error"], flush=True)
+            return
+    print(f"Nano 副本已全部加载：{_nano_count['loaded']} 份", flush=True)
 
 
 def _model_key(model: str, spk: bool) -> str:
@@ -99,7 +139,10 @@ async def preload():
 
 @app.get("/health")
 def health():
-    info = {"device": DEVICE, "models": list(_models), "busy": _busy["value"]}
+    info = {"device": DEVICE, "models": list(_models), "busy": _busy["value"],
+            "nano_replicas": _nano_count["loaded"], "nano_replicas_target": NANO_REPLICAS}
+    if _nano_count["error"]:
+        info["nano_error"] = _nano_count["error"]
     if torch.cuda.is_available():
         info["gpu"] = torch.cuda.get_device_name(0)
         info["mem_used_mb"] = int(torch.cuda.memory_allocated(0) / 1e6)
@@ -119,7 +162,7 @@ def _run(model_name: str, spk: bool, path: str, hotwords: str, lang: str = "zh")
         sents, no_ts = sentences_from_sensevoice(res)
         return make_result("asr_remote", "sensevoice", 0, sents, no_ts)
     if key == "nano":
-        sents = transcribe_nano(m, path, hot, lang)
+        sents = transcribe_nano(path, hot, lang)
         return make_result("asr_remote", "fun-asr-nano", 0, sents, False)
     res = m.generate(hotword=hot or None, sentence_timestamp=True, **kwargs)
     sents, no_ts = sentences_from_funasr(res)
@@ -143,22 +186,42 @@ def vad_segments(path: str) -> list[list[int]]:
     return [[int(b), int(e)] for b, e in (res[0].get("value") or []) if e > b]
 
 
-def transcribe_nano(m, path: str, hot: str, lang: str, on_raw=None) -> list[dict]:
-    """自己做 VAD，把每段写成临时 wav 按路径逐段送 Nano；每段的 VAD 起止就是这一句的时间戳。"""
+def _nano_generate(seg: str, hot: str, lang: str):
+    """从池里借一份 Nano 识别一段，用完放回。每份模型有自己的 CUDA stream，多线程时 GPU 上能重叠执行。"""
+    m, stream = _nano_pool.get()
+    try:
+        ctx = torch.cuda.stream(stream) if stream is not None else contextlib.nullcontext()
+        with ctx:
+            res = m.generate(**nano_kwargs(seg, hot, lang))
+        if stream is not None:
+            stream.synchronize()
+        return res
+    finally:
+        _nano_pool.put((m, stream))
+
+
+def transcribe_nano(path: str, hot: str, lang: str, on_raw=None) -> list[dict]:
+    """自己做 VAD，把每段写成临时 wav，按路径送 Nano；多段在模型池上并行，结果按原顺序拼回。
+    每段的 VAD 起止就是这一句的时间戳（有逐字时间戳时再细分）。"""
     import soundfile as sf
     from funasr.utils.load_utils import load_audio_text_image_video
 
+    _load("nano")  # 确保至少有一份在池里
     audio = load_audio_text_image_video(path, fs=16000)
     audio = audio.numpy() if hasattr(audio, "numpy") else audio
-    sents = []
     with tempfile.TemporaryDirectory() as tmp:
-        for i, (beg, end) in enumerate(vad_segments(path)):
+        segs = vad_segments(path)
+        files = []
+        for i, (beg, end) in enumerate(segs):
             seg = os.path.join(tmp, f"{i}.wav")
             sf.write(seg, audio[beg * 16:end * 16], 16000)
-            res = m.generate(**nano_kwargs(seg, hot, lang))
-            if on_raw and i == 0:
-                on_raw(res)
-            sents += nano_segment_sentences(res, beg, end)
+            files.append(seg)
+        results = list(_nano_executor.map(lambda f: _nano_generate(f, hot, lang), files))
+    if on_raw and results:
+        on_raw(results[0])
+    sents = []
+    for (beg, end), res in zip(segs, results):
+        sents += nano_segment_sentences(res, beg, end)
     return sents
 
 

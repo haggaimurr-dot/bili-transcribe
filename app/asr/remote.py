@@ -85,15 +85,16 @@ class RemoteASR(ASRBackend):
                                 "model": opts.model, "lang": opts.lang},
                           lambda f: progress_cb(f * 20), uploaded.set)
         expected = opts.duration_ms / 1000 * s.rtf_remote + 5
-        read_timeout = max(120.0, opts.duration_ms / 1000 / 10)
+        # Nano 是 LLM、只能逐段解码，比 paraformer 慢得多，读超时按时长的 1/3 给
+        read_timeout = max(120.0, opts.duration_ms / 1000 / (3 if opts.model == "fun-asr-nano" else 10))
         h = health()
         if h.get("online"):
             key = {"fun-asr-nano": "nano", "sensevoice": "sensevoice"}.get(
                 opts.model, "paraformer+spk" if opts.spk else "paraformer")
             if key not in h.get("models", []):
                 # 模型首次使用要在 worker 上现场下载加载，可能好几分钟
-                read_timeout += FIRST_LOAD_TIMEOUT
-                expected += FIRST_LOAD_TIMEOUT / 3
+                read_timeout += FIRST_LOAD_TIMEOUT  # 超时按最坏情况放宽
+                expected += 60  # 进度按常见情况估（实测 Nano 加载约 1 分钟），不按最坏情况
                 log(f"远程还没加载 {opts.model}，首次使用需要下载加载模型，最多等 {FIRST_LOAD_TIMEOUT // 60} 分钟")
             if h.get("busy"):
                 log("远程 worker 正在处理其他请求，需要排队")
