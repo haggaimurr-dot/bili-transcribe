@@ -11,6 +11,7 @@ from ..errors import AppError, RemoteUnavailable
 from .base import ASRBackend, ASROptions, EstimateTicker
 
 CHUNK = 256 * 1024
+FIRST_LOAD_TIMEOUT = 1200  # 秒；远程模型首次下载加载的额外等待时间
 
 
 def _headers(token: str) -> dict:
@@ -85,6 +86,16 @@ class RemoteASR(ASRBackend):
                           lambda f: progress_cb(f * 20), uploaded.set)
         expected = opts.duration_ms / 1000 * s.rtf_remote + 5
         read_timeout = max(120.0, opts.duration_ms / 1000 / 10)
+        h = health()
+        if h.get("online"):
+            key = "nano" if opts.model == "fun-asr-nano" else ("paraformer+spk" if opts.spk else "paraformer")
+            if key not in h.get("models", []):
+                # 模型首次使用要在 worker 上现场下载加载，可能好几分钟
+                read_timeout += FIRST_LOAD_TIMEOUT
+                expected += FIRST_LOAD_TIMEOUT / 3
+                log(f"远程还没加载 {opts.model}，首次使用需要下载加载模型，最多等 {FIRST_LOAD_TIMEOUT // 60} 分钟")
+            if h.get("busy"):
+                log("远程 worker 正在处理其他请求，需要排队")
         ticker_holder = {}
 
         def start_ticker():

@@ -128,6 +128,11 @@ def delete_task(task_id: int) -> None:
         c.commit()
 
 
+def count_opts_containing(fragment: str) -> int:
+    with _lock:
+        return _db().execute("SELECT COUNT(*) FROM tasks WHERE instr(opts_json, ?) > 0", (fragment,)).fetchone()[0]
+
+
 def mark_interrupted() -> int:
     """服务重启：把未结束的任务标记为失败。"""
     err = json.dumps({"code": "INTERRUPTED", "message": "服务重启，任务中断", "hint": "点「重试」重新执行"},

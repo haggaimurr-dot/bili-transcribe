@@ -4,9 +4,11 @@ import json
 import shutil
 import subprocess
 import sys
+import uuid
+from pathlib import Path
 from urllib.parse import quote
 
-from fastapi import APIRouter, File, Request, UploadFile
+from fastapi import APIRouter, File, Form, Request, UploadFile
 from fastapi.responses import PlainTextResponse, Response
 from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
@@ -14,6 +16,7 @@ from sse_starlette.sse import EventSourceResponse
 from . import bili, db, export, settings
 from .asr import REMOTE_MODELS, remote
 from .asr import local as local_asr
+from .config import LOCAL_ID, MEDIA_EXTS, UPLOAD_DIR
 from .errors import AppError
 from .events import ALL, bus
 from .tasks import FINAL, manager
@@ -44,19 +47,54 @@ class TaskIn(BaseModel):
     model: str = "paraformer-zh"
 
 
+def _check_backend(backend: str, model: str) -> str:
+    """校验后端和模型，返回实际使用的模型。"""
+    if backend not in ("local", "remote"):
+        raise AppError("BAD_REQUEST", "未知的识别后端")
+    if backend == "local":
+        return "paraformer-zh"
+    if model not in REMOTE_MODELS:
+        raise AppError("BAD_REQUEST", f"远程不支持模型 {model}")
+    return model
+
+
 @router.post("/tasks")
 def create_tasks(body: TaskIn):
     meta = bili.parse(body.text)
     valid = {p["index"] for p in meta["parts"]}
     parts = [p for p in dict.fromkeys(body.parts) if p in valid] or [meta["parts"][0]["index"]]
-    if body.backend not in ("local", "remote"):
-        raise AppError("BAD_REQUEST", "未知的识别后端")
-    if body.backend == "local" and body.model != "paraformer-zh":
-        body.model = "paraformer-zh"
-    if body.backend == "remote" and body.model not in REMOTE_MODELS:
-        raise AppError("BAD_REQUEST", f"远程不支持模型 {body.model}")
+    body.model = _check_backend(body.backend, body.model)
     opts = body.model_dump(exclude={"text", "parts"})
     ids = manager.create(bvid=meta["bvid"], parts=parts, meta=meta, opts=opts)
+    return {"ids": ids}
+
+
+@router.post("/upload")
+async def upload_task(file: UploadFile = File(...), hotwords: str = Form("[]"), spk: bool = Form(False),
+                      backend: str = Form("local"), model: str = Form("paraformer-zh")):
+    """上传本地音视频文件直接转录，不经过 B 站。"""
+    name = Path(file.filename or "upload").name
+    ext = Path(name).suffix.lower()
+    if ext not in MEDIA_EXTS:
+        raise AppError("BAD_FILE", f"不支持的文件类型 {ext or '（无扩展名）'}",
+                       "支持常见视频（mp4/mkv/flv…）和音频（mp3/m4a/wav…）")
+    model = _check_backend(backend, model)
+    try:
+        words = [str(w) for w in json.loads(hotwords)]
+    except (ValueError, TypeError):
+        words = hotwords.split()
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    dst = UPLOAD_DIR / f"{uuid.uuid4().hex}{ext}"
+    with open(dst, "wb") as f:
+        while chunk := await file.read(1024 * 1024):
+            f.write(chunk)
+    if dst.stat().st_size == 0:
+        dst.unlink(missing_ok=True)
+        raise AppError("BAD_FILE", "上传的文件是空的")
+    opts = {"force_asr": True, "hotwords": words, "spk": spk, "backend": backend, "model": model,
+            "upload_path": str(dst), "filename": name}
+    meta = {"title": Path(name).stem, "uploader": None, "parts": [{"index": 1, "title": None, "duration": 0}]}
+    ids = manager.create(bvid=LOCAL_ID, parts=[1], meta=meta, opts=opts)
     return {"ids": ids}
 
 

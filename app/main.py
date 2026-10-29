@@ -82,9 +82,25 @@ def pick_port() -> int:
     raise SystemExit(f"端口 {DEFAULT_PORT}–{DEFAULT_PORT + PORT_TRIES - 1} 都被占用")
 
 
+def other_instance_running() -> bool:
+    """默认端口上已有本工具在运行（两个实例共用同一个数据库，会互相干扰）。"""
+    import httpx
+
+    try:
+        r = httpx.get(f"http://{HOST}:{DEFAULT_PORT}/api/status", timeout=2)
+        return r.status_code == 200 and "ytdlp" in r.json()
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def main() -> None:
     setup_logging()
     check_deps()
+    if other_instance_running():
+        raise SystemExit(
+            f"[错误] {DEFAULT_PORT} 端口上已经有一个 bili-transcribe 在运行（可能是旧版本）。\n"
+            "请先关闭它的窗口（或在任务管理器结束对应的 python 进程），再重新启动。"
+        )
     port = pick_port()
     url = f"http://{HOST}:{port}/"
     config = uvicorn.Config(app, host=HOST, port=port, log_level="warning")

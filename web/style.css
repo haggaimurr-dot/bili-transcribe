@@ -128,6 +128,11 @@ label.check input { accent-color: var(--accent); width: 16px; height: 16px; }
   background-size: 200% 100%; animation: shimmer 1.2s infinite; }
 @keyframes shimmer { to { background-position: -200% 0; } }
 
+.card.dragging { border-color: var(--accent); background: var(--accent-weak); }
+.filebox { display: flex; gap: 10px; align-items: center; margin-top: 14px; padding: 10px 12px;
+  border: 1px solid var(--border); border-radius: 8px; background: var(--panel-2); }
+.filebox .t { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
 .opts { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px 20px; margin: 16px 0; }
 
 /* ---------- 任务卡片 ---------- */

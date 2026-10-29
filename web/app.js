@@ -11,6 +11,9 @@ const STAGE = {
 const SOURCE = { subtitle_cc: "CC 字幕", subtitle_ai: "AI 字幕", asr_local: "本地识别", asr_remote: "GPU 识别" };
 const FINAL = ["done", "failed", "cancelled"];
 const MODELS = { local: ["paraformer-zh"], remote: ["paraformer-zh", "fun-asr-nano"] };
+const MODEL_LABEL = { "paraformer-zh": "paraformer-zh（推荐）", "fun-asr-nano": "fun-asr-nano（实验性，首次加载要几分钟）" };
+const MEDIA_EXTS = [".mp4", ".mkv", ".flv", ".mov", ".avi", ".webm", ".m4s", ".ts",
+  ".mp3", ".m4a", ".aac", ".wav", ".flac", ".ogg", ".opus", ".wma", ".amr"];
 
 const clock = (ms) => {
   const s = Math.max(0, Math.floor((ms || 0) / 1000));
@@ -23,7 +26,8 @@ const when = (ts) => (ts ? new Date(ts * 1000).toLocaleString("zh-CN", { hour12:
 const isActive = (t) => t && !FINAL.includes(t.status);
 const taskTitle = (t) => (t.part_title ? `${t.title} · P${t.part} ${t.part_title}` : `${t.title}${t.part > 1 ? " · P" + t.part : ""}`);
 const escapeHtml = (s) => s.replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
-const bvUrl = (t, ms) => `https://www.bilibili.com/video/${t.bvid}?p=${t.part}${ms != null ? "&t=" + Math.floor(ms / 1000) : ""}`;
+const isLocal = (t) => t && t.bvid === "LOCAL";
+const bvUrl = (t, ms) => isLocal(t) ? null : `https://www.bilibili.com/video/${t.bvid}?p=${t.part}${ms != null ? "&t=" + Math.floor(ms / 1000) : ""}`;
 
 // ---------------- 全局状态 ----------------
 
@@ -186,6 +190,24 @@ const Home = {
       store.get("opts", {}),
     ));
     const recentIds = ref([]);
+    const file = ref(null);
+    const fileInput = ref(null);
+    const dragging = ref(false);
+    const uploadPct = ref(0);
+
+    function pickFile(f) {
+      if (!f) return;
+      const ext = (f.name.match(/\.[^.]+$/) || [""])[0].toLowerCase();
+      if (!MEDIA_EXTS.includes(ext)) {
+        toast(`不支持的文件类型 ${ext || "（无扩展名）"}`, { hint: "支持常见视频和音频文件", error: true });
+        return;
+      }
+      file.value = f;
+      text.value = "";
+    }
+    const onFileInput = (e) => { pickFile(e.target.files[0]); e.target.value = ""; };
+    const onDrop = (e) => { dragging.value = false; pickFile(e.dataTransfer.files[0]); };
+    const fileSize = (n) => (n >= 1 << 30 ? (n / (1 << 30)).toFixed(2) + " GB" : (n / (1 << 20)).toFixed(1) + " MB");
 
     watch(opts, () => store.set("opts", { ...opts }), { deep: true });
     watch(() => opts.backend, (b) => { if (!MODELS[b].includes(opts.model)) opts.model = MODELS[b][0]; });
@@ -193,6 +215,7 @@ const Home = {
     let timer, seq = 0;
     watch(text, (v) => {
       clearTimeout(timer);
+      if (v.trim()) file.value = null;
       if (!v.trim()) {
         parsed.value = null;
         parseErr.value = null;
@@ -231,12 +254,55 @@ const Home = {
 
     const remoteOff = computed(() => !state.remote.online);
 
+    function hotwordList() {
+      const words = [...opts.hotwords];
+      for (const g of groups.value) if (opts.groups.includes(g.name)) for (const w of g.words) if (!words.includes(w)) words.push(w);
+      return words;
+    }
+
+    // fetch 拿不到上传进度，用 XHR
+    function uploadFile() {
+      return new Promise((resolve, reject) => {
+        const form = new FormData();
+        form.append("file", file.value);
+        form.append("hotwords", JSON.stringify(hotwordList()));
+        form.append("spk", opts.spk);
+        form.append("backend", opts.backend);
+        form.append("model", opts.model);
+        const xhr = new XMLHttpRequest();
+        xhr.open("POST", "/api/upload");
+        xhr.upload.onprogress = (e) => { if (e.lengthComputable) uploadPct.value = Math.floor((e.loaded * 100) / e.total); };
+        xhr.onload = () => {
+          let data = {};
+          try { data = JSON.parse(xhr.responseText); } catch {}
+          if (xhr.status === 200) resolve(data);
+          else reject((data && data.error) || { message: `上传失败（${xhr.status}）` });
+        };
+        xhr.onerror = () => reject({ message: "上传失败：无法连接本地服务" });
+        xhr.send(form);
+      });
+    }
+
     async function submit() {
+      if (file.value) {
+        submitting.value = true;
+        uploadPct.value = 0;
+        try {
+          const r = await uploadFile();
+          toast("已上传，开始转录");
+          recentIds.value = [...r.ids, ...recentIds.value];
+          file.value = null;
+        } catch (e) {
+          toast(e.message, { hint: e.hint, error: true, ms: 6000 });
+        } finally {
+          submitting.value = false;
+        }
+        return;
+      }
       if (!parsed.value || !selected.value.length) return;
       submitting.value = true;
       try {
-        const words = [...opts.hotwords];
-        for (const g of groups.value) if (opts.groups.includes(g.name)) for (const w of g.words) if (!words.includes(w)) words.push(w);
+        const words = hotwordList();
         const r = await api("/tasks", {
           method: "POST",
           body: {
@@ -271,14 +337,27 @@ const Home = {
     });
 
     return { text, parsing, parsed, parseErr, selected, opts, groups, submitting, submit, recent, allChecked,
-      toggleAll, invert, dur, remoteOff, MODELS, state };
+      toggleAll, invert, dur, remoteOff, MODELS, MODEL_LABEL, state, file, fileInput, dragging, uploadPct, onFileInput, onDrop,
+      fileSize };
   },
   template: `
-    <div class="card">
+    <div class="card" :class="{dragging}" @dragover.prevent="dragging = true" @dragleave.self="dragging = false" @drop.prevent="onDrop">
       <h2>转录 B 站视频</h2>
       <textarea class="url" v-model="text" placeholder="粘贴链接、BV 号、b23.tv 短链或分享文案"></textarea>
+      <div class="row" style="margin-top:10px">
+        <span class="muted">或</span>
+        <button class="btn sm" @click="fileInput.click()">上传本地音视频文件</button>
+        <span class="muted">也可以直接把文件拖进这里</span>
+        <input type="file" ref="fileInput" style="display:none" accept="video/*,audio/*,.flv,.mkv,.m4s" @change="onFileInput">
+      </div>
 
-      <div v-if="parsing" class="skeleton" style="margin-top:14px"></div>
+      <div v-if="file" class="filebox">
+        <span class="chip accent">本地文件</span>
+        <span class="t grow" :title="file.name">{{ file.name }}</span>
+        <span class="muted">{{ fileSize(file.size) }}</span>
+        <button class="btn sm" @click="file = null" :disabled="submitting">移除</button>
+      </div>
+      <div v-else-if="parsing" class="skeleton" style="margin-top:14px"></div>
       <div v-else-if="parseErr" class="err" style="color:var(--err);margin-top:10px">
         {{ parseErr.message }}<span v-if="parseErr.hint" class="muted"> — {{ parseErr.hint }}</span>
       </div>
@@ -305,9 +384,11 @@ const Home = {
             <span class="muted">{{ dur(p.duration) }}</span>
           </label>
         </div>
+      </template>
 
+      <template v-if="file || (parsed && !parsing && !parseErr)">
         <div class="opts">
-          <label class="check"><input type="checkbox" v-model="opts.force_asr"> 强制转录（忽略字幕）</label>
+          <label class="check" v-if="!file"><input type="checkbox" v-model="opts.force_asr"> 强制转录（忽略字幕）</label>
           <label class="check"><input type="checkbox" v-model="opts.spk"> 区分说话人（较慢）</label>
           <div>
             <select v-model="opts.backend">
@@ -317,7 +398,7 @@ const Home = {
           </div>
           <div>
             <select v-model="opts.model">
-              <option v-for="m in MODELS[opts.backend]" :value="m">{{ m }}</option>
+              <option v-for="m in MODELS[opts.backend]" :value="m">{{ MODEL_LABEL[m] || m }}</option>
             </select>
           </div>
         </div>
@@ -330,8 +411,9 @@ const Home = {
           </div>
         </div>
         <div class="row">
-          <button class="btn primary" :disabled="!selected.length || submitting" @click="submit">开始转录（{{ selected.length }}）</button>
-          <span class="muted" v-if="!opts.force_asr">有字幕的分P会直接使用字幕</span>
+          <button class="btn primary" v-if="file" :disabled="submitting" @click="submit">{{ submitting ? '上传中 ' + uploadPct + '%' : '上传并转录' }}</button>
+          <button class="btn primary" v-else :disabled="!selected.length || submitting" @click="submit">开始转录（{{ selected.length }}）</button>
+          <span class="muted" v-if="!file && !opts.force_asr">有字幕的分P会直接使用字幕</span>
         </div>
       </template>
     </div>
@@ -421,7 +503,7 @@ const TaskView = {
     }
 
     return { task, result, loading, q, hits, cur, step, hl, copyAll, dl, retranscribe, toggleLog, showLog, logText,
-      clock, SOURCE, isActive, taskTitle, bvUrl };
+      clock, SOURCE, isActive, taskTitle, bvUrl, isLocal };
   },
   template: `
     <div v-if="!task && loading" class="skeleton"></div>
@@ -432,8 +514,10 @@ const TaskView = {
           <div class="grow">
             <h2 style="margin-bottom:4px">{{ taskTitle(task) }}</h2>
             <div class="muted">
-              <a :href="bvUrl(task)" target="_blank" rel="noopener">{{ task.bvid }} P{{ task.part }}</a>
-              · {{ task.uploader || '-' }} · {{ clock(task.duration_ms) }}
+              <template v-if="isLocal(task)">本地文件 · {{ task.opts && task.opts.filename }}</template>
+              <template v-else><a :href="bvUrl(task)" target="_blank" rel="noopener">{{ task.bvid }} P{{ task.part }}</a>
+              · {{ task.uploader || '-' }}</template>
+              · {{ clock(task.duration_ms) }}
               <span v-if="result"> · {{ result.sentences.length }} 句</span>
             </div>
           </div>
@@ -467,7 +551,8 @@ const TaskView = {
         <div class="sents">
           <div v-for="(s, i) in result.sentences" :key="i" :id="'s' + i" class="sent"
                :class="{hit: hits.includes(i), cur: hits[cur] === i}">
-            <a class="ts" v-if="!result.no_timestamp" :href="bvUrl(task, s.start)" target="_blank" rel="noopener">{{ clock(s.start) }}</a>
+            <span class="ts" v-if="!result.no_timestamp && isLocal(task)">{{ clock(s.start) }}</span>
+            <a class="ts" v-else-if="!result.no_timestamp" :href="bvUrl(task, s.start)" target="_blank" rel="noopener">{{ clock(s.start) }}</a>
             <span class="spk" v-if="s.spk != null" :style="{color: 'var(--spk-' + (s.spk % 5) + ')'}">说话人{{ s.spk + 1 }}</span>
             <span class="tx" v-html="hl(s.text)"></span>
           </div>

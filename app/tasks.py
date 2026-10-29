@@ -1,14 +1,16 @@
 """任务队列与工作线程。"""
+import json
 import logging
 import queue
 import re
 import threading
 import time
 import traceback
+from pathlib import Path
 
 from . import bili, db, export, settings
 from .asr import ASROptions, LocalASR, get_backend
-from .config import RESULTS_DIR, TASK_LOG_DIR
+from .config import CACHE_DIR, LOCAL_ID, RESULTS_DIR, TASK_LOG_DIR
 from .errors import AppError, Cancelled, RemoteUnavailable
 from .events import bus
 
@@ -84,7 +86,8 @@ class TaskManager:
                 bvid=bvid, part=n, title=meta.get("title") or bvid,
                 part_title=pt.get("title") if len(part_titles) > 1 else None,
                 uploader=meta.get("uploader"), duration_ms=int((pt.get("duration") or 0) * 1000),
-                url=bili.part_url(bvid, n), backend=opts.get("backend"), model=opts.get("model"),
+                url="" if bvid == LOCAL_ID else bili.part_url(bvid, n),
+                backend=opts.get("backend"), model=opts.get("model"),
                 opts=opts, message="",
             )
             ids.append(tid)
@@ -118,7 +121,11 @@ class TaskManager:
 
     def delete(self, task_id: int) -> None:
         self.cancel(task_id)
+        t = db.get_task(task_id)
         db.delete_task(task_id)
+        upload = t and t["opts"].get("upload_path")
+        if upload and not db.count_opts_containing(json.dumps(upload, ensure_ascii=False)):
+            Path(upload).unlink(missing_ok=True)  # 重试任务共用同一个上传文件，最后一个删掉时再删
         d = RESULTS_DIR / str(task_id)
         if d.exists():
             for f in d.iterdir():
@@ -183,6 +190,47 @@ class TaskManager:
         tid, vid, p, opts = t["id"], t["bvid"], t["part"], t["opts"]
         cancel = self.cancels.setdefault(tid, threading.Event())
         tl(f"开始任务 {vid} P{p}，参数 {opts}")
+        upload = opts.get("upload_path")
+        if upload:
+            result, wav = None, self._prepare_upload(tid, Path(upload), tl)
+        else:
+            result, wav = self._prepare_bili(t, tl, cancel)
+        self._check(cancel)
+
+        if result is None:
+            duration_ms = bili.probe_duration_ms(wav)
+            db.update_task(tid, duration_ms=duration_ms)
+            self._check(cancel)
+            result = self._transcribe(tid, wav, opts, duration_ms, cancel, tl)
+            if settings.load().auto_delete_audio:
+                if upload:  # 只删转换出的 wav/ogg，上传的原文件留着供重试
+                    wav.unlink(missing_ok=True)
+                    wav.with_suffix(".ogg").unlink(missing_ok=True)
+                else:
+                    bili.remove_audio(vid, p)
+
+        # ⑤ 导出
+        self._stage(tid, "exporting")
+        db.set_result(tid, result)
+        db.update_task(tid, source=result["source"], model=result.get("model"),
+                       duration_ms=result.get("duration_ms") or db.get_task(tid)["duration_ms"])
+        export.write_all(db.get_task(tid), result)
+        tl(f"已导出到 data/results/{tid}/，共 {len(result['sentences'])} 句")
+
+    def _prepare_upload(self, tid: int, src: Path, tl: TaskLog) -> Path:
+        """本地上传：跳过解析、字幕和下载，直接转成 16k wav。"""
+        prog = self._stage(tid, "downloading", "转换音频")
+        if not src.exists():
+            raise AppError("UPLOAD_MISSING", "上传的文件已不存在", "请重新上传")
+        wav = CACHE_DIR / f"upload_{tid}.wav"
+        bili.to_wav(src, wav)
+        prog(100)
+        tl(f"已把上传文件 {src.name} 转为 16k 单声道 wav")
+        return wav
+
+    def _prepare_bili(self, t: dict, tl: TaskLog, cancel: threading.Event):
+        """B 站：解析 → 字幕优先 → 下载音频。返回 (字幕结果或 None, wav 或 None)。"""
+        tid, vid, p, opts = t["id"], t["bvid"], t["part"], t["opts"]
 
         # ① 解析
         self._stage(tid, "parsing")
@@ -214,41 +262,32 @@ class TaskManager:
             else:
                 tl("没有可用字幕" + ("" if settings.cookie_file() else "（未配置 Cookie，配置后可能能拿到 AI 字幕）"))
         self._check(cancel)
+        if result is not None:
+            return result, None
 
-        if result is None:
-            # ③ 下载音频
-            prog = self._stage(tid, "downloading")
-            wav = bili.download_audio(vid, p, prog, cancel, tl)
-            duration_ms = bili.probe_duration_ms(wav)
-            db.update_task(tid, duration_ms=duration_ms)
-            self._check(cancel)
+        # ③ 下载音频
+        prog = self._stage(tid, "downloading")
+        return None, bili.download_audio(vid, p, prog, cancel, tl)
 
-            # ④ 识别
-            backend_name = opts.get("backend") or settings.load().default_backend
-            model = opts.get("model") or "paraformer-zh"
-            asr_opts = ASROptions(hotwords=opts.get("hotwords") or [], spk=bool(opts.get("spk")),
-                                  model=model, duration_ms=duration_ms)
-            prog = self._stage(tid, "transcribing", "正在识别" if backend_name == "local" else "上传到远程 GPU")
-            backend = get_backend(backend_name)
-            try:
-                result = backend.transcribe(wav, asr_opts, prog, cancel, tl)
-            except RemoteUnavailable as e:
-                tl(f"远程不可用（{e.message}），已切换本地识别")
-                db.update_task(tid, backend="local", model="paraformer-zh")
-                prog = self._stage(tid, "transcribing", "远程不可用，已切换本地")
-                asr_opts.model = "paraformer-zh"
-                result = LocalASR().transcribe(wav, asr_opts, prog, cancel, tl)
-            self._check(cancel)
-            if settings.load().auto_delete_audio:
-                bili.remove_audio(vid, p)
-
-        # ⑤ 导出
-        self._stage(tid, "exporting")
-        db.set_result(tid, result)
-        db.update_task(tid, source=result["source"], model=result.get("model"),
-                       duration_ms=result.get("duration_ms") or duration_ms)
-        export.write_all(db.get_task(tid), result)
-        tl(f"已导出到 data/results/{tid}/，共 {len(result['sentences'])} 句")
+    def _transcribe(self, tid: int, wav: Path, opts: dict, duration_ms: int, cancel: threading.Event,
+                    tl: TaskLog) -> dict:
+        # ④ 识别
+        backend_name = opts.get("backend") or settings.load().default_backend
+        model = opts.get("model") or "paraformer-zh"
+        asr_opts = ASROptions(hotwords=opts.get("hotwords") or [], spk=bool(opts.get("spk")),
+                              model=model, duration_ms=duration_ms)
+        prog = self._stage(tid, "transcribing", "正在识别" if backend_name == "local" else "上传到远程 GPU")
+        backend = get_backend(backend_name)
+        try:
+            result = backend.transcribe(wav, asr_opts, prog, cancel, tl)
+        except RemoteUnavailable as e:
+            tl(f"远程不可用（{e.message}），已切换本地识别")
+            db.update_task(tid, backend="local", model="paraformer-zh")
+            prog = self._stage(tid, "transcribing", "远程不可用，已切换本地")
+            asr_opts.model = "paraformer-zh"
+            result = LocalASR().transcribe(wav, asr_opts, prog, cancel, tl)
+        self._check(cancel)
+        return result
 
 
 manager = TaskManager()

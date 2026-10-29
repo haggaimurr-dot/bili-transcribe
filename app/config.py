@@ -5,6 +5,7 @@ ROOT = Path(__file__).resolve().parent.parent
 DATA = ROOT / "data"
 CACHE_DIR = DATA / "cache"
 RESULTS_DIR = DATA / "results"
+UPLOAD_DIR = DATA / "uploads"
 LOG_DIR = DATA / "logs"
 TASK_LOG_DIR = LOG_DIR / "tasks"
 DB_PATH = DATA / "app.db"
@@ -16,6 +17,9 @@ DEFAULT_PORT = 8765
 PORT_TRIES = 11  # 8765–8775
 
 MAX_DURATION_MS = 6 * 3600 * 1000
+LOCAL_ID = "LOCAL"  # 本地上传文件的任务，bvid 字段用这个标记
+MEDIA_EXTS = (".mp4", ".mkv", ".flv", ".mov", ".avi", ".webm", ".m4s", ".ts",
+              ".mp3", ".m4a", ".aac", ".wav", ".flac", ".ogg", ".opus", ".wma", ".amr")
 PARSE_CACHE_TTL = 600
 UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -24,5 +28,5 @@ UA = (
 
 
 def ensure_dirs() -> None:
-    for d in (DATA, CACHE_DIR, RESULTS_DIR, LOG_DIR, TASK_LOG_DIR):
+    for d in (DATA, CACHE_DIR, RESULTS_DIR, UPLOAD_DIR, LOG_DIR, TASK_LOG_DIR):
         d.mkdir(parents=True, exist_ok=True)

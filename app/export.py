@@ -3,7 +3,7 @@ import io
 import re
 import zipfile
 
-from .config import RESULTS_DIR
+from .config import LOCAL_ID, RESULTS_DIR
 
 SOURCE_LABEL = {
     "subtitle_cc": "B站 CC 字幕",
@@ -59,6 +59,9 @@ def _spk_name(spk) -> str:
 
 
 def task_url(task: dict) -> str:
+    """B 站任务返回视频地址；本地上传返回空串。"""
+    if task["bvid"] == LOCAL_ID:
+        return ""
     return f"https://www.bilibili.com/video/{task['bvid']}?p={task['part']}"
 
 
@@ -69,7 +72,10 @@ def display_title(task: dict) -> str:
 
 
 def to_txt(task: dict, result: dict) -> str:
-    lines = [display_title(task), task_url(task), f"来源：{SOURCE_LABEL.get(result['source'], result['source'])}", ""]
+    lines = [display_title(task)]
+    if task_url(task):
+        lines.append(task_url(task))
+    lines += [f"来源：{SOURCE_LABEL.get(result['source'], result['source'])}", ""]
     for p in paragraphs(result["sentences"]):
         text = _join([s["text"] for s in p])
         if "spk" in p[0]:
@@ -121,7 +127,7 @@ def to_srt(task: dict, result: dict) -> str:
 def to_md(task: dict, result: dict) -> str:
     url = task_url(task)
     meta = [
-        f"> 链接：{url}",
+        f"> 链接：{url}" if url else f"> 文件：{task.get('opts', {}).get('filename') or task.get('title')}",
         f"> UP 主：{task.get('uploader') or '-'}",
         f"> 时长：{fmt_clock(result.get('duration_ms') or task.get('duration_ms') or 0)}",
         f"> 来源：{SOURCE_LABEL.get(result['source'], result['source'])}",
@@ -133,9 +139,11 @@ def to_md(task: dict, result: dict) -> str:
     for p in paragraphs(result["sentences"]):
         text = _join([s["text"] for s in p])
         prefix = ""
-        if not no_ts:
+        if not no_ts and url:
             sec = p[0]["start"] // 1000
             prefix = f"[\\[{fmt_clock(p[0]['start'])}\\]]({url}&t={sec}) "
+        elif not no_ts:
+            prefix = f"\\[{fmt_clock(p[0]['start'])}\\] "
         if "spk" in p[0]:
             prefix += f"**{_spk_name(p[0]['spk'])}**："
         lines += [prefix + text, ""]
