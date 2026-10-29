@@ -27,6 +27,18 @@ fi
 
 pip install -r worker/requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
 
+# Fun-ASR-Nano 的模型代码（model.py 等）在官方仓库里，不在 ModelScope 的模型目录里
+FUN_ASR_DIR=$DATA/Fun-ASR
+if [ ! -f "$FUN_ASR_DIR/model.py" ]; then
+  echo "clone Fun-ASR 仓库到 $FUN_ASR_DIR"
+  (source /etc/network_turbo 2>/dev/null; git clone --depth 1 https://github.com/FunAudioLLM/Fun-ASR.git "$FUN_ASR_DIR")
+fi
+if [ -f "$FUN_ASR_DIR/requirements.txt" ]; then
+  # 跳过 torch/torchaudio，避免覆盖镜像里和 CUDA 匹配的版本
+  grep -viE '^(torch|torchaudio|torchvision)([<>=~! ]|$)' "$FUN_ASR_DIR/requirements.txt" > /tmp/funasr-nano-req.txt
+  pip install -r /tmp/funasr-nano-req.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+fi
+
 # 预下载模型到数据盘，重新开机不用再下载
 python - <<'PY'
 from funasr import AutoModel

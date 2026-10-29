@@ -18,7 +18,8 @@ const LANGS = [
 ];
 const LANG_LABEL = Object.fromEntries(LANGS);
 const FINAL = ["done", "failed", "cancelled"];
-const MODELS = { local: ["paraformer-zh"], remote: ["paraformer-zh", "fun-asr-nano"] };
+// fun-asr-nano 在 worker 上缺 model.py，修好前不开放（见问题文档 #006/#014）
+const MODELS = { local: ["paraformer-zh"], remote: ["paraformer-zh"] };
 const MODEL_LABEL = { "paraformer-zh": "paraformer-zh（推荐）", "fun-asr-nano": "fun-asr-nano（实验性，首次加载要几分钟）" };
 const MEDIA_EXTS = [".mp4", ".mkv", ".flv", ".mov", ".avi", ".webm", ".m4s", ".ts",
   ".mp3", ".m4a", ".aac", ".wav", ".flac", ".ogg", ".opus", ".wma", ".amr"];
@@ -160,7 +161,11 @@ const TagInput = {
 const TaskItem = {
   props: ["task"],
   setup(props) {
-    const cancel = () => api(`/tasks/${props.task.id}/cancel`, { method: "POST" });
+    const cancel = async () => {
+      await api(`/tasks/${props.task.id}/cancel`, { method: "POST" });
+      toast(props.task.status === "transcribing" ? "已请求取消，识别中途无法打断，当前识别结束后停止" : "已请求取消",
+        { ms: 6000 });
+    };
     const retry = async () => {
       const r = await api(`/tasks/${props.task.id}/retry`, { method: "POST", body: {} });
       toast("已重新加入队列");
@@ -214,6 +219,10 @@ const Home = {
       store.get("opts", {}),
     ));
     const recentIds = ref([]);
+    // 实时推送和提交返回都会加同一个任务 ID，先到的加、后到的跳过
+    const addRecent = (ids) => {
+      recentIds.value = [...new Set([...ids, ...recentIds.value])];
+    };
     const file = ref(null);
     const fileInput = ref(null);
     const dragging = ref(false);
@@ -233,6 +242,8 @@ const Home = {
     const onDrop = (e) => { dragging.value = false; pickFile(e.dataTransfer.files[0]); };
     const fileSize = (n) => (n >= 1 << 30 ? (n / (1 << 30)).toFixed(2) + " GB" : (n / (1 << 20)).toFixed(1) + " MB");
 
+    // 记住的参数里可能有已下线的模型
+    if (!MODELS[opts.backend] || !MODELS[opts.backend].includes(opts.model)) opts.model = "paraformer-zh";
     watch(opts, () => store.set("opts", { ...opts }), { deep: true });
     watch(() => opts.backend, (b) => { if (!MODELS[b].includes(opts.model)) opts.model = MODELS[b][0]; });
 
@@ -317,7 +328,7 @@ const Home = {
         try {
           const r = await uploadFile();
           toast("已上传，开始转录");
-          recentIds.value = [...r.ids, ...recentIds.value];
+          addRecent(r.ids);
           file.value = null;
         } catch (e) {
           toast(e.message, { hint: e.hint, error: true, ms: 6000 });
@@ -338,7 +349,7 @@ const Home = {
           },
         });
         toast(`已创建 ${r.ids.length} 个任务`);
-        recentIds.value = [...r.ids.slice().reverse(), ...recentIds.value];
+        addRecent(r.ids.slice().reverse());
         text.value = "";
       } finally {
         submitting.value = false;
@@ -361,7 +372,7 @@ const Home = {
     watch(() => Object.keys(state.tasks).length, () => {
       const known = new Set(recentIds.value);
       const fresh = Object.values(state.tasks).filter((t) => !known.has(t.id) && isActive(t)).map((t) => t.id);
-      if (fresh.length) recentIds.value = [...fresh.sort((a, b) => b - a), ...recentIds.value];
+      if (fresh.length) addRecent(fresh.sort((a, b) => b - a));
     });
 
     return { text, parsing, parsed, parseErr, selected, opts, groups, submitting, submit, recent, allChecked,

@@ -25,6 +25,9 @@ from common.asr_format import (clean_hotwords, make_result, sentences_from_funas
 TOKEN = os.environ.get("ASR_TOKEN", "")
 DEVICE = os.environ.get("ASR_DEVICE", "cuda:0" if torch.cuda.is_available() else "cpu")
 NANO_MODEL = os.environ.get("NANO_MODEL", "FunAudioLLM/Fun-ASR-Nano-2512")
+# Fun-ASR 官方仓库（https://github.com/FunAudioLLM/Fun-ASR），Nano 的模型代码 model.py 在仓库根目录，setup.sh 负责 clone
+FUN_ASR_DIR = os.environ.get("FUN_ASR_DIR", "/root/autodl-tmp/Fun-ASR")
+NANO_LANG = {"zh": "中文", "en": "英文", "ja": "日文"}
 PRELOAD_SPK = os.environ.get("PRELOAD_SPK", "1") == "1"
 
 _models: dict[str, object] = {}
@@ -51,9 +54,14 @@ def _load(key: str):
             m = AutoModel(model="iic/SenseVoiceSmall", vad_model="fsmn-vad",
                           vad_kwargs={"max_single_segment_time": 30000}, **common)
         elif key == "nano":
-            # Fun-ASR-Nano 基于 LLM；时间戳能力需在部署时验证（见实施文档）
-            m = AutoModel(model=NANO_MODEL, vad_model="fsmn-vad", vad_kwargs={"max_single_segment_time": 30000},
-                          trust_remote_code=True, **common)
+            # 官方用法：trust_remote_code + remote_code 指向 Fun-ASR 仓库的 model.py；长音频配 fsmn-vad 分段
+            code = os.path.join(FUN_ASR_DIR, "model.py")
+            if not os.path.exists(code):
+                raise RuntimeError(f"缺少 {code}，请先执行 bash worker/setup.sh（会 clone Fun-ASR 仓库）")
+            if FUN_ASR_DIR not in sys.path:
+                sys.path.insert(0, FUN_ASR_DIR)  # model.py 会 import 同目录下的其他模块
+            m = AutoModel(model=NANO_MODEL, trust_remote_code=True, remote_code=code, vad_model="fsmn-vad",
+                          vad_kwargs={"max_single_segment_time": 30000}, **common)
         else:
             raise KeyError(key)
         _models[key] = m
@@ -107,17 +115,33 @@ def _run(model_name: str, spk: bool, path: str, hotwords: str, lang: str = "zh")
         sents, no_ts = sentences_from_sensevoice(res)
         return make_result("asr_remote", "sensevoice", 0, sents, no_ts)
     if key == "nano":
-        if hot:
-            kwargs["hotwords"] = hot.split()
-        res = m.generate(**kwargs)
-    else:
-        res = m.generate(hotword=hot or None, sentence_timestamp=True, **kwargs)
+        res = m.generate(**nano_kwargs(path, hot, lang))
+        sents, no_ts = sentences_from_nano(res)
+        return make_result("asr_remote", "fun-asr-nano", 0, sents, no_ts)
+    res = m.generate(hotword=hot or None, sentence_timestamp=True, **kwargs)
     sents, no_ts = sentences_from_funasr(res)
-    if key == "nano" and no_ts and isinstance(res, list) and len(res) > 1:
-        # 多段 VAD 结果拼接
-        texts = [str(r.get("text", "")).strip() for r in res if r.get("text")]
-        sents = [{"start": 0, "end": 0, "text": "".join(texts)}]
-    return make_result("asr_remote", "fun-asr-nano" if key == "nano" else "paraformer-zh", 0, sents, no_ts)
+    return make_result("asr_remote", "paraformer-zh", 0, sents, no_ts)
+
+
+def nano_kwargs(path: str, hot: str, lang: str) -> dict:
+    """Fun-ASR-Nano 的 generate 参数（官方示例：cache={}、hotwords 列表、language、itn）。"""
+    kw = {"input": [path], "cache": {}, "batch_size_s": 120, "itn": True}
+    if hot:
+        kw["hotwords"] = hot.split()
+    if lang in NANO_LANG:
+        kw["language"] = NANO_LANG[lang]
+    return kw
+
+
+def sentences_from_nano(res) -> tuple[list[dict], bool]:
+    """Nano 输出 → 句子。优先用 sentence_info；没有就每段一句；都没有时间就整段文本。
+    真实输出结构以 worker/test_nano.py 在 GPU 上的结果为准。"""
+    sents, no_ts = sentences_from_funasr(res)
+    if not no_ts:
+        return sents, False
+    items = res if isinstance(res, list) else [res or {}]
+    texts = [str(r.get("text", "")).strip() for r in items if r.get("text")]
+    return ([{"start": 0, "end": 0, "text": "".join(texts)}] if texts else []), True
 
 
 @app.post("/transcribe")

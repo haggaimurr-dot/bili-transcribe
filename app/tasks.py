@@ -134,6 +134,13 @@ class TaskManager:
         ev.set()
         if t["status"] == "queued":
             self._finish(task_id, "cancelled")
+            return
+        # 下载能立刻中断；识别（FunASR generate）中途停不下来，只能等这一段跑完
+        msg = ("正在取消：识别中途无法打断，当前识别结束后停止" if t["status"] == "transcribing"
+               else "正在取消…")
+        TaskLog(task_id)("收到取消请求")
+        db.update_task(task_id, message=msg)
+        self._emit(task_id)
 
     def retry(self, task_id: int, force_asr: bool | None = None) -> int:
         t = db.get_task(task_id)
