@@ -263,7 +263,13 @@ def cache_key(vid: str, p: int) -> str:
 
 
 def download_audio(vid: str, p: int, progress_cb, cancel_event: threading.Event, log) -> Path:
-    key = cache_key(vid, p)
+    return fetch_audio(part_url(vid, p), cache_key(vid, p), _ydl_opts(format="bestaudio/best"),
+                       progress_cb, cancel_event, log, map_ytdlp_error)
+
+
+def fetch_audio(url: str, key: str, ydl_opts: dict, progress_cb, cancel_event: threading.Event, log,
+                map_error) -> Path:
+    """用 yt-dlp 只下载音频并转成 16k 单声道 wav（B 站和 YouTube 共用）。"""
     wav = CACHE_DIR / f"{key}.wav"
     if wav.exists() and wav.stat().st_size > 1000:
         log("已有音频缓存，跳过下载")
@@ -278,11 +284,10 @@ def download_audio(vid: str, p: int, progress_cb, cancel_event: threading.Event,
             if total:
                 progress_cb(min(99.0, d.get("downloaded_bytes", 0) * 100 / total))
 
-    opts = _ydl_opts(format="bestaudio/best", outtmpl=str(CACHE_DIR / f"{key}.%(ext)s"),
-                     progress_hooks=[hook], overwrites=True)
+    opts = {**ydl_opts, "outtmpl": str(CACHE_DIR / f"{key}.%(ext)s"), "progress_hooks": [hook], "overwrites": True}
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(part_url(vid, p), download=True)
+            info = ydl.extract_info(url, download=True)
             reqs = info.get("requested_downloads") or []
             src = Path(reqs[0]["filepath"]) if reqs else Path(ydl.prepare_filename(info))
     except DownloadCancelled as e:
@@ -292,7 +297,7 @@ def download_audio(vid: str, p: int, progress_cb, cancel_event: threading.Event,
         _cleanup_parts(key)
         if cancel_event.is_set():
             raise Cancelled() from e
-        raise map_ytdlp_error(e) from e
+        raise map_error(e) from e
     progress_cb(100)
     log(f"音频下载完成：{src.name}（{src.stat().st_size / 1e6:.1f} MB）")
     to_wav(src, wav)
@@ -343,7 +348,11 @@ def probe_duration_ms(path: Path) -> int:
 
 
 def remove_audio(vid: str, p: int) -> None:
-    for f in glob.glob(str(CACHE_DIR / f"{cache_key(vid, p)}.*")):
+    remove_audio_key(cache_key(vid, p))
+
+
+def remove_audio_key(key: str) -> None:
+    for f in glob.glob(str(CACHE_DIR / f"{glob.escape(key)}.*")):
         Path(f).unlink(missing_ok=True)
 
 

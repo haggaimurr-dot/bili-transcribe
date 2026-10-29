@@ -82,13 +82,14 @@ class RemoteASR(ASRBackend):
         log(f"上传音频 {ogg.stat().st_size / 1e6:.1f} MB 到 {base}")
         uploaded = threading.Event()
         body = _Multipart(ogg, {"hotwords": " ".join(opts.hotwords), "spk": "1" if opts.spk else "0",
-                                "model": opts.model},
+                                "model": opts.model, "lang": opts.lang},
                           lambda f: progress_cb(f * 20), uploaded.set)
         expected = opts.duration_ms / 1000 * s.rtf_remote + 5
         read_timeout = max(120.0, opts.duration_ms / 1000 / 10)
         h = health()
         if h.get("online"):
-            key = "nano" if opts.model == "fun-asr-nano" else ("paraformer+spk" if opts.spk else "paraformer")
+            key = {"fun-asr-nano": "nano", "sensevoice": "sensevoice"}.get(
+                opts.model, "paraformer+spk" if opts.spk else "paraformer")
             if key not in h.get("models", []):
                 # 模型首次使用要在 worker 上现场下载加载，可能好几分钟
                 read_timeout += FIRST_LOAD_TIMEOUT
@@ -122,6 +123,11 @@ class RemoteASR(ASRBackend):
         if r.status_code == 401:
             raise AppError("REMOTE_UNAUTHORIZED", "远程 Token 错误", "在「设置」里核对 worker 的 ASR_TOKEN")
         if r.status_code >= 500:
+            try:
+                detail = r.json().get("detail", "")
+            except ValueError:
+                detail = r.text[:300]
+            log(f"远程返回 HTTP {r.status_code}：{detail}")
             raise RemoteUnavailable(f"远程服务错误 HTTP {r.status_code}")
         if r.status_code != 200:
             detail = r.json().get("detail", r.text) if r.headers.get("content-type", "").startswith(

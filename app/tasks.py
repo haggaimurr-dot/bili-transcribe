@@ -8,7 +8,9 @@ import time
 import traceback
 from pathlib import Path
 
-from . import bili, db, export, settings
+from common.asr_format import SENSEVOICE_LANGS
+
+from . import bili, db, export, platforms, settings, youtube
 from .asr import ASROptions, LocalASR, get_backend
 from .config import CACHE_DIR, LOCAL_ID, RESULTS_DIR, TASK_LOG_DIR
 from .errors import AppError, Cancelled, RemoteUnavailable
@@ -28,7 +30,34 @@ def _mask_secrets(text: str) -> str:
     for v in (s.sessdata, s.bili_jct, s.remote_token):
         if v and len(v) > 4:
             text = text.replace(v, "****" + v[-4:])
+    text = re.sub(r"(://)[^/@\s:]+:[^/@\s]+@", r"\1****@", text)  # 代理地址里的账号密码
     return re.sub(r"(SESSDATA=)[^;\s]+", r"\1****", text)
+
+
+def resolve_asr(opts: dict, platform: str, video_lang: str | None, log) -> tuple[str, str]:
+    """按任务的识别语言和视频原语言决定 (lang, model)。
+
+    中文用 paraformer-zh（或远程 fun-asr-nano）；英日韩粤用 sensevoice；
+    lang=auto 时，YouTube 看视频的 language 字段，B 站和本地文件默认中文。
+    """
+    want = (opts.get("lang") or "auto").lower()
+    model = opts.get("model") or "paraformer-zh"
+    if want == "auto":
+        vl = youtube.norm_lang(video_lang) if platform == platforms.YOUTUBE else None
+        if platform != platforms.YOUTUBE:
+            want = "zh"
+        elif vl in SENSEVOICE_LANGS:
+            want = vl
+            log(f"视频原语言 {video_lang}，按 {want} 识别")
+        elif vl is None:
+            want = "auto"
+            log("视频没有标注语言，交给 SenseVoice 自动判断语种")
+        else:
+            want = "auto"
+            log(f"视频原语言 {video_lang} 不在支持范围（中英日韩粤），识别效果可能很差，建议改用 YouTube 自带字幕")
+    if want == "zh":
+        return "zh", (model if model in ("paraformer-zh", "fun-asr-nano") else "paraformer-zh")
+    return want, "sensevoice"
 
 
 class TaskLog:
@@ -77,16 +106,17 @@ class TaskManager:
             log.info("重启恢复：%d 个未完成任务已标记为失败", n)
         self.thread.start()
 
-    def create(self, *, bvid: str, parts: list[int], meta: dict, opts: dict) -> list[int]:
+    def create(self, *, bvid: str, parts: list[int], meta: dict, opts: dict, platform: str | None = None) -> list[int]:
         ids = []
+        platform = platform or (platforms.LOCAL if bvid == LOCAL_ID else platforms.BILIBILI)
         part_titles = {p["index"]: p for p in meta.get("parts", [])}
         for n in parts:
             pt = part_titles.get(n, {})
             tid = db.insert_task(
-                bvid=bvid, part=n, title=meta.get("title") or bvid,
+                platform=platform, bvid=bvid, part=n, title=meta.get("title") or bvid,
                 part_title=pt.get("title") if len(part_titles) > 1 else None,
                 uploader=meta.get("uploader"), duration_ms=int((pt.get("duration") or 0) * 1000),
-                url="" if bvid == LOCAL_ID else bili.part_url(bvid, n),
+                url=platforms.video_url(platform, bvid, n),
                 backend=opts.get("backend"), model=opts.get("model"),
                 opts=opts, message="",
             )
@@ -114,7 +144,8 @@ class TaskManager:
             opts["force_asr"] = force_asr
         meta = {"title": t["title"], "uploader": t["uploader"],
                 "parts": [{"index": t["part"], "title": t["part_title"], "duration": (t["duration_ms"] or 0) / 1000}]}
-        new_id = self.create(bvid=t["bvid"], parts=[t["part"]], meta=meta, opts=opts)[0]
+        new_id = self.create(bvid=t["bvid"], parts=[t["part"]], meta=meta, opts=opts,
+                             platform=platforms.platform_of(t))[0]
         if t["part_title"]:
             db.update_task(new_id, part_title=t["part_title"])
         return new_id
@@ -191,8 +222,12 @@ class TaskManager:
         cancel = self.cancels.setdefault(tid, threading.Event())
         tl(f"开始任务 {vid} P{p}，参数 {opts}")
         upload = opts.get("upload_path")
+        platform = platforms.platform_of(t)
+        video_lang = None
         if upload:
             result, wav = None, self._prepare_upload(tid, Path(upload), tl)
+        elif platform == platforms.YOUTUBE:
+            result, wav, video_lang = self._prepare_youtube(t, tl, cancel)
         else:
             result, wav = self._prepare_bili(t, tl, cancel)
         self._check(cancel)
@@ -201,11 +236,14 @@ class TaskManager:
             duration_ms = bili.probe_duration_ms(wav)
             db.update_task(tid, duration_ms=duration_ms)
             self._check(cancel)
-            result = self._transcribe(tid, wav, opts, duration_ms, cancel, tl)
+            lang, model = resolve_asr(opts, platform, video_lang, tl)
+            result = self._transcribe(tid, wav, {**opts, "model": model, "lang": lang}, duration_ms, cancel, tl)
             if settings.load().auto_delete_audio:
                 if upload:  # 只删转换出的 wav/ogg，上传的原文件留着供重试
                     wav.unlink(missing_ok=True)
                     wav.with_suffix(".ogg").unlink(missing_ok=True)
+                elif platform == platforms.YOUTUBE:
+                    bili.remove_audio_key(youtube.cache_key(vid))
                 else:
                     bili.remove_audio(vid, p)
 
@@ -269,22 +307,64 @@ class TaskManager:
         prog = self._stage(tid, "downloading")
         return None, bili.download_audio(vid, p, prog, cancel, tl)
 
+    def _prepare_youtube(self, t: dict, tl: TaskLog, cancel: threading.Event):
+        """YouTube：解析 → 字幕优先（人工 > 原语言自动字幕）→ 下载音频。返回 (字幕结果, wav, 视频语言)。"""
+        tid, vid, opts = t["id"], t["bvid"], t["opts"]
+        self._stage(tid, "parsing")
+        if settings.youtube_proxy():
+            tl("YouTube 请求走代理")
+        info = youtube.info(vid)
+        duration_ms = int((info.get("duration") or 0) * 1000)
+        lang = youtube.guess_lang(info)
+        upd = {"uploader": info.get("channel") or info.get("uploader") or t["uploader"]}
+        if duration_ms:
+            upd["duration_ms"] = duration_ms
+        db.update_task(tid, **upd)
+        if info.get("language"):
+            tl(f"视频原语言：{lang}")
+        else:
+            tl("视频没有标注语言" + ("，标题是中文，按中文处理" if lang == "zh" else ""))
+        self._check(cancel)
+
+        if not opts.get("force_asr"):
+            self._stage(tid, "subtitle")
+            picked = youtube.pick_subtitle(info)
+            if picked:
+                kind, sub_lang, source = picked
+                tl(f"找到{'人工' if kind == 'manual' else '自动'}字幕 {sub_lang}，直接使用")
+                try:
+                    sents = youtube.fetch_subtitle(info, kind, sub_lang)
+                except Exception as e:  # noqa: BLE001
+                    tl(f"字幕下载失败：{e}，改走转录")
+                    sents = []
+                if sents:
+                    return ({"source": source, "model": f"subtitle:{sub_lang}", "duration_ms": duration_ms,
+                             "sentences": sents}, None, lang)
+            else:
+                tl("没有可用字幕（人工字幕和原语言自动字幕都没有）")
+        self._check(cancel)
+
+        prog = self._stage(tid, "downloading")
+        return None, youtube.download_audio(vid, prog, cancel, tl), lang
+
     def _transcribe(self, tid: int, wav: Path, opts: dict, duration_ms: int, cancel: threading.Event,
                     tl: TaskLog) -> dict:
         # ④ 识别
         backend_name = opts.get("backend") or settings.load().default_backend
         model = opts.get("model") or "paraformer-zh"
         asr_opts = ASROptions(hotwords=opts.get("hotwords") or [], spk=bool(opts.get("spk")),
-                              model=model, duration_ms=duration_ms)
+                              model=model, duration_ms=duration_ms, lang=opts.get("lang") or "zh")
+        db.update_task(tid, model=model)
         prog = self._stage(tid, "transcribing", "正在识别" if backend_name == "local" else "上传到远程 GPU")
         backend = get_backend(backend_name)
         try:
             result = backend.transcribe(wav, asr_opts, prog, cancel, tl)
         except RemoteUnavailable as e:
             tl(f"远程不可用（{e.message}），已切换本地识别")
-            db.update_task(tid, backend="local", model="paraformer-zh")
+            if asr_opts.model == "fun-asr-nano":
+                asr_opts.model = "paraformer-zh"
+            db.update_task(tid, backend="local", model=asr_opts.model)
             prog = self._stage(tid, "transcribing", "远程不可用，已切换本地")
-            asr_opts.model = "paraformer-zh"
             result = LocalASR().transcribe(wav, asr_opts, prog, cancel, tl)
         self._check(cancel)
         return result

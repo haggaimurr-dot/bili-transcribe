@@ -8,7 +8,15 @@ const STAGE = {
   queued: "排队中", parsing: "解析", subtitle: "查找字幕", downloading: "下载音频",
   transcribing: "识别中", exporting: "导出", done: "完成", failed: "失败", cancelled: "已取消",
 };
-const SOURCE = { subtitle_cc: "CC 字幕", subtitle_ai: "AI 字幕", asr_local: "本地识别", asr_remote: "GPU 识别" };
+const SOURCE = {
+  subtitle_cc: "CC 字幕", subtitle_ai: "AI 字幕", subtitle_yt: "YouTube 字幕", subtitle_yt_auto: "YouTube 自动字幕",
+  asr_local: "本地识别", asr_remote: "GPU 识别",
+};
+const PLATFORM = { bilibili: "B站", youtube: "YouTube", local: "本地文件" };
+const LANGS = [
+  ["auto", "自动（按视频语言）"], ["zh", "中文"], ["en", "英语"], ["ja", "日语"], ["ko", "韩语"], ["yue", "粤语"],
+];
+const LANG_LABEL = Object.fromEntries(LANGS);
 const FINAL = ["done", "failed", "cancelled"];
 const MODELS = { local: ["paraformer-zh"], remote: ["paraformer-zh", "fun-asr-nano"] };
 const MODEL_LABEL = { "paraformer-zh": "paraformer-zh（推荐）", "fun-asr-nano": "fun-asr-nano（实验性，首次加载要几分钟）" };
@@ -26,8 +34,23 @@ const when = (ts) => (ts ? new Date(ts * 1000).toLocaleString("zh-CN", { hour12:
 const isActive = (t) => t && !FINAL.includes(t.status);
 const taskTitle = (t) => (t.part_title ? `${t.title} · P${t.part} ${t.part_title}` : `${t.title}${t.part > 1 ? " · P" + t.part : ""}`);
 const escapeHtml = (s) => s.replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
-const isLocal = (t) => t && t.bvid === "LOCAL";
-const bvUrl = (t, ms) => isLocal(t) ? null : `https://www.bilibili.com/video/${t.bvid}?p=${t.part}${ms != null ? "&t=" + Math.floor(ms / 1000) : ""}`;
+const platformOf = (t) => (t && t.platform) || (t && t.bvid === "LOCAL" ? "local" : "bilibili");
+const isLocal = (t) => platformOf(t) === "local";
+// 视频地址；ms 有值时跳到对应时间点
+const bvUrl = (t, ms) => {
+  const p = platformOf(t);
+  if (p === "local") return null;
+  const sec = ms != null ? Math.floor(ms / 1000) : null;
+  if (p === "youtube") return `https://www.youtube.com/watch?v=${t.bvid}${sec != null ? "&t=" + sec + "s" : ""}`;
+  return `https://www.bilibili.com/video/${t.bvid}?p=${t.part}${sec != null ? "&t=" + sec : ""}`;
+};
+// 这次识别会不会走中文模型（决定热词、说话人分离能不能用）
+const isZhAsr = (lang, platform, videoLang) => {
+  if (lang === "zh") return true;
+  if (lang !== "auto") return false;
+  if (platform !== "youtube") return true;
+  return !!videoLang && videoLang.toLowerCase().startsWith("zh");
+};
 
 // ---------------- 全局状态 ----------------
 
@@ -147,13 +170,14 @@ const TaskItem = {
       if (!confirm("删除这条任务及其结果？")) return;
       await api(`/tasks/${props.task.id}`, { method: "DELETE" });
     };
-    return { STAGE, SOURCE, isActive, taskTitle, clock, cancel, retry, remove };
+    return { STAGE, SOURCE, PLATFORM, platformOf, isActive, taskTitle, clock, cancel, retry, remove };
   },
   template: `
     <div class="task">
       <div class="info">
         <a class="title" :href="'#/task/' + task.id" :title="taskTitle(task)">{{ taskTitle(task) }}</a>
         <div class="sub">
+          <span class="chip plat" :class="platformOf(task)">{{ PLATFORM[platformOf(task)] }}</span>
           <span class="chip" :class="{accent: isActive(task), err: task.status==='failed', sub: task.status==='done'}">{{ STAGE[task.status] || task.status }}</span>
           <span v-if="task.source" class="chip">{{ SOURCE[task.source] }}</span>
           <span v-if="task.duration_ms">{{ clock(task.duration_ms) }}</span>
@@ -186,7 +210,7 @@ const Home = {
     const submitting = ref(false);
     const groups = ref([]);
     const opts = reactive(Object.assign(
-      { force_asr: false, spk: false, backend: "local", model: "paraformer-zh", hotwords: [], groups: [] },
+      { force_asr: false, spk: false, backend: "local", model: "paraformer-zh", lang: "auto", hotwords: [], groups: [] },
       store.get("opts", {}),
     ));
     const recentIds = ref([]);
@@ -253,6 +277,8 @@ const Home = {
     };
 
     const remoteOff = computed(() => !state.remote.online);
+    const curPlatform = computed(() => (file.value ? "local" : parsed.value ? parsed.value.platform : "bilibili"));
+    const zhAsr = computed(() => isZhAsr(opts.lang, curPlatform.value, parsed.value && parsed.value.language));
 
     function hotwordList() {
       const words = [...opts.hotwords];
@@ -269,6 +295,7 @@ const Home = {
         form.append("spk", opts.spk);
         form.append("backend", opts.backend);
         form.append("model", opts.model);
+        form.append("lang", opts.lang);
         const xhr = new XMLHttpRequest();
         xhr.open("POST", "/api/upload");
         xhr.upload.onprogress = (e) => { if (e.lengthComputable) uploadPct.value = Math.floor((e.loaded * 100) / e.total); };
@@ -307,7 +334,7 @@ const Home = {
           method: "POST",
           body: {
             text: text.value, parts: selected.value, force_asr: opts.force_asr, spk: opts.spk,
-            backend: opts.backend, model: opts.model, hotwords: words,
+            backend: opts.backend, model: opts.model, hotwords: words, lang: opts.lang,
           },
         });
         toast(`已创建 ${r.ids.length} 个任务`);
@@ -326,7 +353,8 @@ const Home = {
       recentIds.value = list.items.map((t) => t.id);
       groups.value = s.hotword_groups || [];
       if (!store.get("opts", null)) {
-        Object.assign(opts, { backend: s.default_backend, model: s.default_model, spk: s.default_spk, force_asr: s.default_force_asr });
+        Object.assign(opts, { backend: s.default_backend, model: s.default_model, spk: s.default_spk, force_asr: s.default_force_asr,
+          lang: s.default_lang || "auto" });
       }
     });
     // 别处（重试等）新建的任务也显示出来
@@ -338,12 +366,12 @@ const Home = {
 
     return { text, parsing, parsed, parseErr, selected, opts, groups, submitting, submit, recent, allChecked,
       toggleAll, invert, dur, remoteOff, MODELS, MODEL_LABEL, state, file, fileInput, dragging, uploadPct, onFileInput, onDrop,
-      fileSize };
+      fileSize, LANGS, LANG_LABEL, PLATFORM, zhAsr, curPlatform };
   },
   template: `
     <div class="card" :class="{dragging}" @dragover.prevent="dragging = true" @dragleave.self="dragging = false" @drop.prevent="onDrop">
-      <h2>转录 B 站视频</h2>
-      <textarea class="url" v-model="text" placeholder="粘贴链接、BV 号、b23.tv 短链或分享文案"></textarea>
+      <h2>转录 B 站 / YouTube 视频</h2>
+      <textarea class="url" v-model="text" placeholder="粘贴 B 站链接、BV 号、b23.tv 短链，或 YouTube 链接（youtube.com / youtu.be）"></textarea>
       <div class="row" style="margin-top:10px">
         <span class="muted">或</span>
         <button class="btn sm" @click="fileInput.click()">上传本地音视频文件</button>
@@ -366,8 +394,12 @@ const Home = {
         <div class="video">
           <img v-if="parsed.cover" :src="parsed.cover" referrerpolicy="no-referrer" alt="">
           <div class="meta grow">
-            <h3>{{ parsed.title }}</h3>
-            <div class="muted">{{ parsed.bvid }} · UP 主 {{ parsed.uploader || '-' }} · 共 {{ parsed.parts.length }} P</div>
+            <h3><span class="chip plat" :class="parsed.platform">{{ PLATFORM[parsed.platform] }}</span> {{ parsed.title }}</h3>
+            <div class="muted" v-if="parsed.platform === 'youtube'">
+              {{ parsed.bvid }} · 频道 {{ parsed.uploader || '-' }} · 原语言 {{ parsed.language || '未标注' }}{{ parsed.language && !parsed.language_tagged ? '（按标题推断）' : '' }}
+              <template v-if="parsed.subs"> · 人工字幕 {{ parsed.subs.manual.length ? parsed.subs.manual.join(', ') : '无' }} · 原语言自动字幕 {{ parsed.subs.auto ? '有' : '无' }}</template>
+            </div>
+            <div class="muted" v-else>{{ parsed.bvid }} · UP 主 {{ parsed.uploader || '-' }} · 共 {{ parsed.parts.length }} P</div>
             <div class="row" style="margin-top:8px" v-if="parsed.parts.length > 1">
               <button class="btn sm" @click="toggleAll">{{ allChecked ? '全不选' : '全选' }}</button>
               <button class="btn sm" @click="invert">反选</button>
@@ -378,7 +410,7 @@ const Home = {
         <div class="parts">
           <label v-for="p in parsed.parts" :key="p.index">
             <input type="checkbox" :value="p.index" v-model="selected">
-            <span class="chip">P{{ p.index }}</span>
+            <span class="chip" v-if="parsed.platform !== 'youtube'">P{{ p.index }}</span>
             <span class="t" :title="p.title">{{ p.title }}</span>
             <span class="chip sub" v-if="p.subtitles.length" :title="p.subtitles.join(', ')">有字幕</span>
             <span class="muted">{{ dur(p.duration) }}</span>
@@ -389,20 +421,27 @@ const Home = {
       <template v-if="file || (parsed && !parsing && !parseErr)">
         <div class="opts">
           <label class="check" v-if="!file"><input type="checkbox" v-model="opts.force_asr"> 强制转录（忽略字幕）</label>
-          <label class="check"><input type="checkbox" v-model="opts.spk"> 区分说话人（较慢）</label>
+          <label class="check" :title="zhAsr ? '' : '多语言模型 SenseVoice 不支持区分说话人'">
+            <input type="checkbox" v-model="opts.spk" :disabled="!zhAsr"> 区分说话人（较慢{{ zhAsr ? '' : '，仅中文' }}）</label>
+          <div>
+            <select v-model="opts.lang" title="识别语言：中文用 paraformer，英日韩粤用 SenseVoice">
+              <option v-for="[v, l] in LANGS" :value="v">识别语言：{{ l }}</option>
+            </select>
+          </div>
           <div>
             <select v-model="opts.backend">
               <option value="local">本地 CPU 识别</option>
               <option value="remote" :disabled="remoteOff">远程 GPU 识别{{ remoteOff ? '（离线）' : '' }}</option>
             </select>
           </div>
-          <div>
+          <div v-if="zhAsr">
             <select v-model="opts.model">
               <option v-for="m in MODELS[opts.backend]" :value="m">{{ MODEL_LABEL[m] || m }}</option>
             </select>
           </div>
         </div>
-        <div class="field">
+        <div class="muted" v-if="!zhAsr" style="margin:-6px 0 10px">非中文内容用多语言模型 SenseVoice 识别：不支持热词和区分说话人。有字幕的视频会优先直接用字幕。</div>
+        <div class="field" v-if="zhAsr">
           <span class="label">热词（回车添加，专业名词、人名等）</span>
           <TagInput v-model="opts.hotwords" placeholder="例如：犬瘟热 细小病毒"></TagInput>
           <div class="row" style="margin-top:8px" v-if="groups.length">
@@ -413,7 +452,7 @@ const Home = {
         <div class="row">
           <button class="btn primary" v-if="file" :disabled="submitting" @click="submit">{{ submitting ? '上传中 ' + uploadPct + '%' : '上传并转录' }}</button>
           <button class="btn primary" v-else :disabled="!selected.length || submitting" @click="submit">开始转录（{{ selected.length }}）</button>
-          <span class="muted" v-if="!file && !opts.force_asr">有字幕的分P会直接使用字幕</span>
+          <span class="muted" v-if="!file && !opts.force_asr">有字幕时会直接使用字幕{{ curPlatform === 'youtube' ? '（人工字幕优先，其次原语言自动字幕）' : '' }}</span>
         </div>
       </template>
     </div>
@@ -503,7 +542,7 @@ const TaskView = {
     }
 
     return { task, result, loading, q, hits, cur, step, hl, copyAll, dl, retranscribe, toggleLog, showLog, logText,
-      clock, SOURCE, isActive, taskTitle, bvUrl, isLocal };
+      clock, SOURCE, isActive, taskTitle, bvUrl, isLocal, platformOf, PLATFORM };
   },
   template: `
     <div v-if="!task && loading" class="skeleton"></div>
@@ -515,7 +554,8 @@ const TaskView = {
             <h2 style="margin-bottom:4px">{{ taskTitle(task) }}</h2>
             <div class="muted">
               <template v-if="isLocal(task)">本地文件 · {{ task.opts && task.opts.filename }}</template>
-              <template v-else><a :href="bvUrl(task)" target="_blank" rel="noopener">{{ task.bvid }} P{{ task.part }}</a>
+              <template v-else><span class="chip plat" :class="platformOf(task)">{{ PLATFORM[platformOf(task)] }}</span>
+              <a :href="bvUrl(task)" target="_blank" rel="noopener">{{ task.bvid }}{{ platformOf(task) === 'youtube' ? '' : ' P' + task.part }}</a>
               · {{ task.uploader || '-' }}</template>
               · {{ clock(task.duration_ms) }}
               <span v-if="result"> · {{ result.sentences.length }} 句</span>
@@ -543,6 +583,7 @@ const TaskView = {
             </template>
           </div>
           <div class="muted" v-if="result.no_timestamp" style="margin-top:8px">该模型没有返回时间戳，srt 只有一条字幕。</div>
+          <div class="muted" v-if="result.source === 'subtitle_yt_auto'" style="margin-top:8px">这是 YouTube 自动生成的字幕，通常没有标点、断句较碎；想要带标点的文本可以点「重新转录」。</div>
         </template>
         <pre class="log" v-if="showLog" style="margin-top:12px">{{ logText }}</pre>
       </div>
@@ -567,20 +608,21 @@ const History = {
   setup() {
     const q = ref("");
     const status = ref("");
+    const platform = ref("");
     const page = ref(1);
     const data = ref({ items: [], total: 0, size: 20 });
     const selected = ref([]);
     const fmt = ref("txt");
 
     async function load() {
-      const p = new URLSearchParams({ q: q.value, status: status.value, page: page.value, size: 20 });
+      const p = new URLSearchParams({ q: q.value, status: status.value, platform: platform.value, page: page.value, size: 20 });
       data.value = await api("/tasks?" + p);
       data.value.items.forEach(upsertTask);
       selected.value = selected.value.filter((id) => data.value.items.some((t) => t.id === id));
     }
     let timer;
     watch(q, () => { clearTimeout(timer); timer = setTimeout(() => { page.value = 1; load(); }, 300); });
-    watch(status, () => { page.value = 1; load(); });
+    watch([status, platform], () => { page.value = 1; load(); });
     watch(page, load);
     onMounted(load);
 
@@ -597,13 +639,19 @@ const History = {
       load();
     }
 
-    return { q, status, page, pages, data, rows, selected, fmt, zip, removeSel, allChecked, toggleAll,
-      STAGE, SOURCE, clock, when, taskTitle };
+    return { q, status, platform, page, pages, data, rows, selected, fmt, zip, removeSel, allChecked, toggleAll,
+      STAGE, SOURCE, PLATFORM, platformOf, clock, when, taskTitle };
   },
   template: `
     <div class="card">
       <div class="row" style="margin-bottom:12px">
-        <div class="grow"><input type="search" v-model="q" placeholder="按标题或 BV 号搜索"></div>
+        <div class="grow"><input type="search" v-model="q" placeholder="按标题、BV 号或 YouTube 视频 ID 搜索"></div>
+        <div style="width:120px">
+          <select v-model="platform">
+            <option value="">全部平台</option><option value="bilibili">B站</option>
+            <option value="youtube">YouTube</option><option value="local">本地文件</option>
+          </select>
+        </div>
         <div style="width:140px">
           <select v-model="status">
             <option value="">全部状态</option><option value="active">进行中</option>
@@ -626,7 +674,8 @@ const History = {
         <tbody>
           <tr v-for="t in rows" :key="t.id">
             <td><input type="checkbox" :value="t.id" v-model="selected"></td>
-            <td class="title"><a :href="'#/task/' + t.id" :title="taskTitle(t)">{{ taskTitle(t) }}</a></td>
+            <td class="title"><span class="chip plat" :class="platformOf(t)">{{ PLATFORM[platformOf(t)] }}</span>
+              <a :href="'#/task/' + t.id" :title="taskTitle(t)">{{ taskTitle(t) }}</a></td>
             <td class="hide-sm"><span class="chip" v-if="t.source">{{ SOURCE[t.source] }}</span></td>
             <td><span class="chip" :class="{sub: t.status==='done', err: t.status==='failed'}">{{ STAGE[t.status] }}</span></td>
             <td class="hide-sm muted">{{ clock(t.duration_ms) }}</td>
@@ -652,7 +701,32 @@ const SettingsView = {
     const testing = ref(false);
     const testResult = ref(null);
     const fileInput = ref(null);
+    const ytFileInput = ref(null);
     const updating = ref(false);
+    const proxyTesting = ref(false);
+    const proxyResult = ref(null);
+
+    async function testProxy() {
+      proxyTesting.value = true;
+      try {
+        proxyResult.value = await api("/settings/proxy/check", { method: "POST", body: { proxy: s.value.youtube_proxy } });
+      } finally {
+        proxyTesting.value = false;
+      }
+    }
+    async function uploadYt(e) {
+      const f = e.target.files[0];
+      if (!f) return;
+      const form = new FormData();
+      form.append("file", f);
+      s.value = await api("/settings/youtube-cookies", { method: "POST", form });
+      toast("YouTube cookies.txt 已导入");
+      e.target.value = "";
+    }
+    async function clearYt() {
+      s.value = await api("/settings/youtube-cookies", { method: "DELETE" });
+      toast("YouTube Cookie 已清除");
+    }
 
     async function load() {
       s.value = await api("/settings");
@@ -712,7 +786,8 @@ const SettingsView = {
       }
     }
     return { s, saving, save, saveCookie, upload, clearCookie, fileInput, test, testing, testResult, addGroup, delGroup,
-      clearCache, updateYtdlp, updating, state, MODELS };
+      clearCache, updateYtdlp, updating, state, MODELS, LANGS, ytFileInput, uploadYt, clearYt, testProxy, proxyTesting,
+      proxyResult };
   },
   template: `
     <div v-if="!s" class="skeleton"></div>
@@ -741,19 +816,41 @@ const SettingsView = {
       </div>
 
       <div class="card">
+        <h2>YouTube</h2>
+        <p class="muted" style="margin-top:-6px">国内访问 YouTube 需要代理。只有 YouTube 的请求走这个代理，B 站照常直连。Clash Verge 默认 <code>http://127.0.0.1:7897</code>，Clash for Windows 默认 <code>7890</code>，v2rayN 默认 <code>10808</code>（socks5）/ <code>10809</code>（http）。</p>
+        <div class="field"><span class="label">代理地址</span><input type="text" v-model="s.youtube_proxy" placeholder="http://127.0.0.1:7897 或 socks5://127.0.0.1:10808"></div>
+        <div class="row" style="margin-bottom:14px">
+          <button class="btn primary" @click="save({youtube_proxy: s.youtube_proxy})" :disabled="saving">保存</button>
+          <button class="btn" @click="testProxy" :disabled="proxyTesting">{{ proxyTesting ? '测试中…' : '测试代理' }}</button>
+          <span v-if="proxyResult && proxyResult.ok" class="chip sub">能连上 YouTube · {{ proxyResult.latency_ms }}ms</span>
+          <span v-else-if="proxyResult" class="chip err">连不上：{{ proxyResult.error }}</span>
+        </div>
+        <p class="muted">遇到「Sign in to confirm you're not a bot」或年龄限制时，用浏览器扩展（如 Get cookies.txt LOCALLY）在已登录的 youtube.com 导出 cookies.txt 上传。只保留 youtube.com / google.com 的条目，和 B 站 Cookie 分开存放。</p>
+        <div class="row">
+          <span v-if="s.youtube_cookie" class="chip sub">已上传 Cookie</span>
+          <span v-else class="chip">未配置 Cookie（可选）</span>
+          <button class="btn" @click="ytFileInput.click()">上传 cookies.txt</button>
+          <input type="file" ref="ytFileInput" accept=".txt" style="display:none" @change="uploadYt">
+          <button class="btn danger" @click="clearYt" v-if="s.youtube_cookie">清除</button>
+        </div>
+      </div>
+
+      <div class="card">
         <h2>识别默认值</h2>
         <div class="opts" style="margin-top:0">
           <div><span class="muted">默认后端</span>
             <select v-model="s.default_backend"><option value="local">本地 CPU</option><option value="remote">远程 GPU</option></select></div>
-          <div><span class="muted">默认模型</span>
+          <div><span class="muted">默认中文模型</span>
             <select v-model="s.default_model"><option v-for="m in MODELS[s.default_backend]" :value="m">{{ m }}</option></select></div>
+          <div><span class="muted">默认识别语言</span>
+            <select v-model="s.default_lang"><option v-for="[v, l] in LANGS" :value="v">{{ l }}</option></select></div>
         </div>
         <div class="row" style="gap:20px">
           <label class="check"><input type="checkbox" v-model="s.default_spk"> 默认区分说话人</label>
           <label class="check"><input type="checkbox" v-model="s.default_force_asr"> 默认强制转录</label>
           <label class="check"><input type="checkbox" v-model="s.auto_delete_audio"> 完成后自动删除音频</label>
         </div>
-        <p class="muted">实测速度：本地 RTF {{ s.rtf_local }}，远程 RTF {{ s.rtf_remote }}（处理 1 秒音频所需的秒数，用于预估进度）</p>
+        <p class="muted">实测速度：本地中文 RTF {{ s.rtf_local }}，本地多语言 RTF {{ s.rtf_sensevoice }}，远程 RTF {{ s.rtf_remote }}（处理 1 秒音频所需的秒数，用于预估进度）</p>
         <button class="btn primary" @click="save()" :disabled="saving">保存</button>
       </div>
 
@@ -830,7 +927,7 @@ const App = {
   },
   template: `
     <header class="topbar">
-      <div class="brand"><i></i>B站转录</div>
+      <div class="brand"><i></i>视频转录</div>
       <nav class="nav">
         <a href="#/" :class="{on: state.route.name==='home'}">转录</a>
         <a href="#/history" :class="{on: state.route.name==='history'}">历史</a>

@@ -13,8 +13,8 @@ from fastapi.responses import PlainTextResponse, Response
 from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
 
-from . import bili, db, export, settings
-from .asr import REMOTE_MODELS, remote
+from . import bili, db, export, platforms, settings
+from .asr import LANGS, REMOTE_MODELS, remote
 from .asr import local as local_asr
 from .config import LOCAL_ID, MEDIA_EXTS, UPLOAD_DIR
 from .errors import AppError
@@ -32,7 +32,7 @@ class ParseIn(BaseModel):
 
 @router.post("/parse")
 def parse(body: ParseIn):
-    return bili.parse(body.text)
+    return platforms.parse(body.text)
 
 
 # ---------------- 任务 ----------------
@@ -45,33 +45,42 @@ class TaskIn(BaseModel):
     spk: bool = False
     backend: str = "local"
     model: str = "paraformer-zh"
+    lang: str = "auto"  # auto | zh | en | ja | ko | yue
 
 
 def _check_backend(backend: str, model: str) -> str:
-    """校验后端和模型，返回实际使用的模型。"""
+    """校验后端和模型，返回中文识别实际使用的模型（非中文由任务按语言改用 sensevoice）。"""
     if backend not in ("local", "remote"):
         raise AppError("BAD_REQUEST", "未知的识别后端")
-    if backend == "local":
+    if backend == "local" or model == "sensevoice":
         return "paraformer-zh"
     if model not in REMOTE_MODELS:
         raise AppError("BAD_REQUEST", f"远程不支持模型 {model}")
     return model
 
 
+def _check_lang(lang: str) -> str:
+    lang = (lang or "auto").lower()
+    if lang not in LANGS:
+        raise AppError("BAD_REQUEST", f"不支持的识别语言 {lang}", "支持 auto / zh / en / ja / ko / yue")
+    return lang
+
+
 @router.post("/tasks")
 def create_tasks(body: TaskIn):
-    meta = bili.parse(body.text)
+    meta = platforms.parse(body.text)
     valid = {p["index"] for p in meta["parts"]}
     parts = [p for p in dict.fromkeys(body.parts) if p in valid] or [meta["parts"][0]["index"]]
     body.model = _check_backend(body.backend, body.model)
+    body.lang = _check_lang(body.lang)
     opts = body.model_dump(exclude={"text", "parts"})
-    ids = manager.create(bvid=meta["bvid"], parts=parts, meta=meta, opts=opts)
+    ids = manager.create(bvid=meta["bvid"], parts=parts, meta=meta, opts=opts, platform=meta["platform"])
     return {"ids": ids}
 
 
 @router.post("/upload")
 async def upload_task(file: UploadFile = File(...), hotwords: str = Form("[]"), spk: bool = Form(False),
-                      backend: str = Form("local"), model: str = Form("paraformer-zh")):
+                      backend: str = Form("local"), model: str = Form("paraformer-zh"), lang: str = Form("zh")):
     """上传本地音视频文件直接转录，不经过 B 站。"""
     name = Path(file.filename or "upload").name
     ext = Path(name).suffix.lower()
@@ -91,16 +100,17 @@ async def upload_task(file: UploadFile = File(...), hotwords: str = Form("[]"), 
     if dst.stat().st_size == 0:
         dst.unlink(missing_ok=True)
         raise AppError("BAD_FILE", "上传的文件是空的")
+    lang = _check_lang(lang)
     opts = {"force_asr": True, "hotwords": words, "spk": spk, "backend": backend, "model": model,
-            "upload_path": str(dst), "filename": name}
+            "lang": "zh" if lang == "auto" else lang, "upload_path": str(dst), "filename": name}
     meta = {"title": Path(name).stem, "uploader": None, "parts": [{"index": 1, "title": None, "duration": 0}]}
     ids = manager.create(bvid=LOCAL_ID, parts=[1], meta=meta, opts=opts)
     return {"ids": ids}
 
 
 @router.get("/tasks")
-def list_tasks(q: str = "", status: str = "", page: int = 1, size: int = 20):
-    return db.list_tasks(q, status, page, min(max(size, 1), 100))
+def list_tasks(q: str = "", status: str = "", page: int = 1, size: int = 20, platform: str = ""):
+    return db.list_tasks(q, status, page, min(max(size, 1), 100), platform)
 
 
 def _task_or_404(task_id: int) -> dict:
@@ -281,6 +291,28 @@ def check_cookies():
     return settings.check_login()
 
 
+@router.post("/settings/youtube-cookies")
+async def upload_youtube_cookies(file: UploadFile = File(...)):
+    raw = (await file.read()).decode("utf-8", errors="replace")
+    settings.save_youtube_cookie(raw)
+    return settings.public(settings.load())
+
+
+@router.delete("/settings/youtube-cookies")
+def delete_youtube_cookies():
+    settings.clear_youtube_cookie()
+    return settings.public(settings.load())
+
+
+class ProxyIn(BaseModel):
+    proxy: str | None = None
+
+
+@router.post("/settings/proxy/check")
+def check_proxy(body: ProxyIn):
+    return settings.check_proxy(body.proxy)
+
+
 # ---------------- 远程 / 状态 / 维护 ----------------
 
 class HealthIn(BaseModel):
@@ -312,6 +344,8 @@ def status():
         "ytdlp": yt_dlp.version.__version__,
         "cookie_configured": settings.cookie_file() is not None,
         "remote_configured": bool(s.remote_url and s.remote_token),
+        "youtube_proxy": bool(s.youtube_proxy.strip()),
+        "youtube_cookie": settings.youtube_cookie_file() is not None,
         "current_task": manager.current,
         "queued": manager.q.qsize(),
     }

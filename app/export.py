@@ -3,11 +3,14 @@ import io
 import re
 import zipfile
 
-from .config import LOCAL_ID, RESULTS_DIR
+from . import platforms
+from .config import RESULTS_DIR
 
 SOURCE_LABEL = {
     "subtitle_cc": "B站 CC 字幕",
     "subtitle_ai": "B站 AI 字幕",
+    "subtitle_yt": "YouTube 字幕",
+    "subtitle_yt_auto": "YouTube 自动字幕",
     "asr_local": "本地识别",
     "asr_remote": "远程 GPU 识别",
 }
@@ -59,10 +62,8 @@ def _spk_name(spk) -> str:
 
 
 def task_url(task: dict) -> str:
-    """B 站任务返回视频地址；本地上传返回空串。"""
-    if task["bvid"] == LOCAL_ID:
-        return ""
-    return f"https://www.bilibili.com/video/{task['bvid']}?p={task['part']}"
+    """视频地址；本地上传返回空串。"""
+    return platforms.task_url(task)
 
 
 def display_title(task: dict) -> str:
@@ -94,9 +95,11 @@ def split_long(s: dict, limit: int = SRT_MAX_CHARS) -> list[dict]:
         if buf and len(buf) + len(seg) > limit:
             pieces.append(buf)
             buf = ""
-        while len(seg) > limit:  # 没有标点的超长片段硬切
-            pieces.append(seg[:limit])
-            seg = seg[limit:]
+        while len(seg) > limit:  # 没有标点的超长片段硬切；英文等有空格的在最后一个空格处切，不切断单词
+            cut = seg.rfind(" ", 1, limit + 1)
+            cut = cut if cut > limit // 2 else limit
+            pieces.append(seg[:cut].rstrip())
+            seg = seg[cut:].lstrip()
         buf += seg
     if buf:
         pieces.append(buf)
@@ -128,7 +131,7 @@ def to_md(task: dict, result: dict) -> str:
     url = task_url(task)
     meta = [
         f"> 链接：{url}" if url else f"> 文件：{task.get('opts', {}).get('filename') or task.get('title')}",
-        f"> UP 主：{task.get('uploader') or '-'}",
+        f"> {'频道' if platforms.platform_of(task) == platforms.YOUTUBE else 'UP 主'}：{task.get('uploader') or '-'}",
         f"> 时长：{fmt_clock(result.get('duration_ms') or task.get('duration_ms') or 0)}",
         f"> 来源：{SOURCE_LABEL.get(result['source'], result['source'])}",
     ]
@@ -140,8 +143,7 @@ def to_md(task: dict, result: dict) -> str:
         text = _join([s["text"] for s in p])
         prefix = ""
         if not no_ts and url:
-            sec = p[0]["start"] // 1000
-            prefix = f"[\\[{fmt_clock(p[0]['start'])}\\]]({url}&t={sec}) "
+            prefix = f"[\\[{fmt_clock(p[0]['start'])}\\]]({platforms.time_url(task, p[0]['start'])}) "
         elif not no_ts:
             prefix = f"\\[{fmt_clock(p[0]['start'])}\\] "
         if "spk" in p[0]:
@@ -166,7 +168,10 @@ def safe_filename(name: str, limit: int = 80) -> str:
 
 
 def filename(task: dict, fmt: str) -> str:
-    return f"{safe_filename(task.get('title') or task['bvid'])}_P{task['part']}.{fmt}"
+    base = safe_filename(task.get("title") or task["bvid"])
+    if platforms.platform_of(task) == platforms.YOUTUBE:
+        return f"{base}.{fmt}"
+    return f"{base}_P{task['part']}.{fmt}"
 
 
 def write_all(task: dict, result: dict) -> None:

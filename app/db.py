@@ -6,10 +6,10 @@ import time
 
 from .config import DB_PATH
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 TASK_COLUMNS = [
-    "id", "bvid", "part", "title", "part_title", "uploader", "duration_ms", "url",
+    "id", "platform", "bvid", "part", "title", "part_title", "uploader", "duration_ms", "url",
     "status", "stage", "percent", "message", "source", "backend", "model",
     "opts_json", "error_json", "created_at", "finished_at",
 ]
@@ -49,8 +49,14 @@ def init() -> None:
             """
         )
         ver = c.execute("PRAGMA user_version").fetchone()[0]
+        if ver < 2:
+            # v2：加 platform 列（bilibili / youtube / local），旧数据按 bvid 回填
+            cols = {r[1] for r in c.execute("PRAGMA table_info(tasks)")}
+            if "platform" not in cols:
+                c.execute("ALTER TABLE tasks ADD COLUMN platform TEXT")
+            c.execute("UPDATE tasks SET platform = CASE WHEN bvid='LOCAL' THEN 'local' ELSE 'bilibili' END "
+                      "WHERE platform IS NULL")
         if ver < SCHEMA_VERSION:
-            # 以后的迁移按版本号依次写在这里
             c.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
         c.commit()
 
@@ -98,8 +104,11 @@ def get_task(task_id: int) -> dict | None:
         return _row(_db().execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone())
 
 
-def list_tasks(q: str = "", status: str = "", page: int = 1, size: int = 20) -> dict:
+def list_tasks(q: str = "", status: str = "", page: int = 1, size: int = 20, platform: str = "") -> dict:
     where, args = [], []
+    if platform:
+        where.append("platform=?")
+        args.append(platform)
     if q:
         where.append("(title LIKE ? OR part_title LIKE ? OR bvid LIKE ?)")
         args += [f"%{q}%"] * 3

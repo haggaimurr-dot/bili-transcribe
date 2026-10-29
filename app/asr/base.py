@@ -8,8 +8,9 @@ from dataclasses import dataclass, field
 class ASROptions:
     hotwords: list[str] = field(default_factory=list)
     spk: bool = False
-    model: str = "paraformer-zh"
+    model: str = "paraformer-zh"  # paraformer-zh | sensevoice | fun-asr-nano
     duration_ms: int = 0
+    lang: str = "zh"  # SenseVoice 的 language 参数：zh/en/ja/ko/yue/auto
 
 
 class ASRBackend:

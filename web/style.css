@@ -187,3 +187,13 @@ td.title { max-width: 360px; overflow: hidden; text-overflow: ellipsis; white-sp
   .hide-sm { display: none; }
   td.title { max-width: 180px; }
 }
+
+/* ---------- 平台标签 ---------- */
+.chip.plat { font-size: 11px; padding: 0 6px; vertical-align: 1px; }
+.chip.plat.bilibili { background: #e3f5fb; color: #0088b8; }
+.chip.plat.youtube { background: #fdecec; color: #c4302b; }
+.chip.plat.local { background: var(--panel-2); color: var(--text-2); }
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) .chip.plat.bilibili { background: #13303b; color: #5cc8ee; }
+  :root:not([data-theme="light"]) .chip.plat.youtube { background: #3a1d1d; color: #ff7b72; }
+}

@@ -6,7 +6,7 @@ import httpx
 from pydantic import BaseModel, Field
 
 from . import db
-from .config import COOKIES_PATH, UA
+from .config import COOKIES_PATH, UA, YT_COOKIES_PATH
 from .errors import AppError
 
 SECRET_FIELDS = ("sessdata", "bili_jct", "dedeuserid", "remote_token")
@@ -31,7 +31,11 @@ class Settings(BaseModel):
     remote_url: str = "http://127.0.0.1:9000"
     remote_token: str = ""
     hotword_groups: list[HotwordGroup] = Field(default_factory=list)
+    default_lang: str = "auto"  # auto | zh | en | ja | ko | yue
+    youtube_proxy: str = ""  # 只给 YouTube 用，例如 http://127.0.0.1:7897
+    youtube_cookie: bool = False  # 是否已上传 YouTube 的 cookies.txt
     rtf_local: float = 0.1
+    rtf_sensevoice: float = 0.06
     rtf_remote: float = 0.01
 
 
@@ -117,8 +121,8 @@ def write_cookie_file(sessdata: str, bili_jct: str = "", dedeuserid: str = "", b
     COOKIES_PATH.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def filter_cookie_text(text: str) -> str:
-    """校验上传的 cookies.txt，只保留 bilibili.com 的条目。"""
+def filter_cookie_text(text: str, domains: tuple[str, ...] = ("bilibili.com",)) -> str:
+    """校验上传的 cookies.txt，只保留指定域名的条目。"""
     kept = []
     for line in text.splitlines():
         if not line.strip() or (line.startswith("#") and not line.startswith("#HttpOnly_")):
@@ -126,13 +130,61 @@ def filter_cookie_text(text: str) -> str:
         parts = line.split("\t")
         if len(parts) != 7:
             continue
-        domain = parts[0].removeprefix("#HttpOnly_")
-        if domain.lstrip(".").endswith("bilibili.com"):
+        domain = parts[0].removeprefix("#HttpOnly_").lstrip(".")
+        if any(domain == d or domain.endswith("." + d) for d in domains):
             kept.append(line)
     if not kept:
-        raise AppError("INVALID_COOKIE", "没有找到有效的 bilibili.com Cookie",
+        raise AppError("INVALID_COOKIE", f"没有找到有效的 {' / '.join(domains)} Cookie",
                        "请用浏览器扩展导出 Netscape 格式的 cookies.txt")
     return "# Netscape HTTP Cookie File\n" + "\n".join(kept) + "\n"
+
+
+# ---------------- YouTube ----------------
+
+YT_DOMAINS = ("youtube.com", "google.com")
+
+
+def save_youtube_cookie(text: str) -> None:
+    content = filter_cookie_text(text, YT_DOMAINS)
+    YT_COOKIES_PATH.parent.mkdir(parents=True, exist_ok=True)
+    YT_COOKIES_PATH.write_text(content, encoding="utf-8")
+    with _lock:
+        s = load()
+        s.youtube_cookie = True
+        save(s)
+    _notify()
+
+
+def clear_youtube_cookie() -> None:
+    YT_COOKIES_PATH.unlink(missing_ok=True)
+    with _lock:
+        s = load()
+        s.youtube_cookie = False
+        save(s)
+    _notify()
+
+
+def youtube_cookie_file() -> str | None:
+    return str(YT_COOKIES_PATH) if load().youtube_cookie and YT_COOKIES_PATH.exists() else None
+
+
+def youtube_proxy() -> str | None:
+    p = load().youtube_proxy.strip()
+    return p or None
+
+
+def check_proxy(proxy: str | None = None) -> dict:
+    """通过代理请求 YouTube 的 generate_204，判断能不能连上。"""
+    proxy = (proxy if proxy is not None else load().youtube_proxy).strip() or None
+    t0 = time.time()
+    try:
+        r = httpx.get("https://www.youtube.com/generate_204", proxy=proxy, timeout=8,
+                      headers={"User-Agent": UA})
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "proxy": proxy, "error": f"{type(e).__name__}：{e}"[:200]}
+    ok = r.status_code == 204
+    return {"ok": ok, "proxy": proxy, "latency_ms": int((time.time() - t0) * 1000),
+            **({} if ok else {"error": f"HTTP {r.status_code}"})}
 
 
 def save_cookie_upload(text: str) -> None:

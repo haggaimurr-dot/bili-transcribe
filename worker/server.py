@@ -19,7 +19,8 @@ from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile  # n
 from fastapi.concurrency import run_in_threadpool  # noqa: E402
 from fastapi.responses import JSONResponse  # noqa: E402
 
-from common.asr_format import clean_hotwords, make_result, sentences_from_funasr  # noqa: E402
+from common.asr_format import (clean_hotwords, make_result, sentences_from_funasr,  # noqa: E402
+                               sentences_from_sensevoice)
 
 TOKEN = os.environ.get("ASR_TOKEN", "")
 DEVICE = os.environ.get("ASR_DEVICE", "cuda:0" if torch.cuda.is_available() else "cpu")
@@ -46,6 +47,9 @@ def _load(key: str):
         elif key == "paraformer+spk":
             m = AutoModel(model="paraformer-zh", vad_model="fsmn-vad", punc_model="ct-punc", spk_model="cam++",
                           **common)
+        elif key == "sensevoice":
+            m = AutoModel(model="iic/SenseVoiceSmall", vad_model="fsmn-vad",
+                          vad_kwargs={"max_single_segment_time": 30000}, **common)
         elif key == "nano":
             # Fun-ASR-Nano 基于 LLM；时间戳能力需在部署时验证（见实施文档）
             m = AutoModel(model=NANO_MODEL, vad_model="fsmn-vad", vad_kwargs={"max_single_segment_time": 30000},
@@ -59,6 +63,8 @@ def _load(key: str):
 def _model_key(model: str, spk: bool) -> str:
     if model == "fun-asr-nano":
         return "nano"
+    if model == "sensevoice":
+        return "sensevoice"
     return "paraformer+spk" if spk else "paraformer"
 
 
@@ -91,11 +97,15 @@ def health():
     return info
 
 
-def _run(model_name: str, spk: bool, path: str, hotwords: str) -> dict:
+def _run(model_name: str, spk: bool, path: str, hotwords: str, lang: str = "zh") -> dict:
     key = _model_key(model_name, spk)
     m = _load(key)
     hot, _ = clean_hotwords(hotwords)
     kwargs = {"input": path, "batch_size_s": 300}
+    if key == "sensevoice":
+        res = m.generate(input=path, language=lang or "auto", use_itn=True, batch_size_s=60, output_timestamp=True)
+        sents, no_ts = sentences_from_sensevoice(res)
+        return make_result("asr_remote", "sensevoice", 0, sents, no_ts)
     if key == "nano":
         if hot:
             kwargs["hotwords"] = hot.split()
@@ -112,9 +122,11 @@ def _run(model_name: str, spk: bool, path: str, hotwords: str) -> dict:
 
 @app.post("/transcribe")
 async def transcribe(file: UploadFile = File(...), hotwords: str = Form(""), spk: str = Form("0"),
-                     model: str = Form("paraformer-zh")):
-    if model not in ("paraformer-zh", "fun-asr-nano"):
+                     model: str = Form("paraformer-zh"), lang: str = Form("zh")):
+    if model not in ("paraformer-zh", "fun-asr-nano", "sensevoice"):
         raise HTTPException(400, f"不支持的模型 {model}")
+    if lang not in ("auto", "zh", "en", "ja", "ko", "yue"):
+        raise HTTPException(400, f"不支持的语言 {lang}")
     suffix = Path(file.filename or "audio.ogg").suffix or ".ogg"
     fd, tmp = tempfile.mkstemp(suffix=suffix)
     try:
@@ -125,7 +137,7 @@ async def transcribe(file: UploadFile = File(...), hotwords: str = Form(""), spk
             _busy["value"] = True
             t0 = time.time()
             try:
-                result = await run_in_threadpool(_run, model, spk == "1", tmp, hotwords)
+                result = await run_in_threadpool(_run, model, spk == "1", tmp, hotwords, lang)
             except Exception as e:  # noqa: BLE001
                 raise HTTPException(500, f"识别失败：{e}") from e
             finally:

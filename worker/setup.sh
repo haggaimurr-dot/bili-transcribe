@@ -33,6 +33,8 @@ from funasr import AutoModel
 AutoModel(model="paraformer-zh", vad_model="fsmn-vad", punc_model="ct-punc", spk_model="cam++",
           disable_update=True)
 print("paraformer-zh / fsmn-vad / ct-punc / cam++ 已就绪")
+AutoModel(model="iic/SenseVoiceSmall", vad_model="fsmn-vad", disable_update=True)
+print("SenseVoiceSmall（英日韩粤）已就绪")
 PY
 
 if [ ! -f worker/.env ]; then

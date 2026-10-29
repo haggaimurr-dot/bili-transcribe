@@ -10,6 +10,7 @@ LOG_DIR = DATA / "logs"
 TASK_LOG_DIR = LOG_DIR / "tasks"
 DB_PATH = DATA / "app.db"
 COOKIES_PATH = DATA / "cookies.txt"
+YT_COOKIES_PATH = DATA / "cookies_youtube.txt"
 WEB_DIR = ROOT / "web"
 
 HOST = "127.0.0.1"
