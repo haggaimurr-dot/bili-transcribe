@@ -25,6 +25,15 @@ if ! python -c "import torch, sys; sys.exit(0 if torch.cuda.is_available() else 
   pip install torch torchaudio --index-url https://download.pytorch.org/whl/$IDX
 fi
 
+# PyTorch 镜像一般只带 torch；Nano 的时间戳（forced_align）要和 torch 版本完全对应的 torchaudio
+if ! python -c "import torchaudio" 2>/dev/null; then
+  TV=$(python -c "import torch;print(torch.__version__.split('+')[0])")
+  CU=$(python -c "import torch;print('cu'+(torch.version.cuda or '').replace('.',''))")
+  echo "安装 torchaudio==$TV（$CU）"
+  (source /etc/network_turbo 2>/dev/null; pip install "torchaudio==$TV" --index-url "https://download.pytorch.org/whl/$CU") \
+    || echo "⚠️ torchaudio 安装失败：paraformer 仍可用（靠 kaldi-native-fbank），Fun-ASR-Nano 的时间戳不可用"
+fi
+
 pip install -r worker/requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
 
 # Fun-ASR-Nano 的模型代码（model.py 等）在官方仓库里，不在 ModelScope 的模型目录里

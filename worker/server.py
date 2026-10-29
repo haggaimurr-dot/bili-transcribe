@@ -124,8 +124,10 @@ def _run(model_name: str, spk: bool, path: str, hotwords: str, lang: str = "zh")
 
 
 def nano_kwargs(path: str, hot: str, lang: str) -> dict:
-    """Fun-ASR-Nano 的 generate 参数（官方示例：cache={}、hotwords 列表、language、itn）。"""
-    kw = {"input": [path], "cache": {}, "batch_size_s": 120, "itn": True}
+    """Fun-ASR-Nano 的 generate 参数（官方示例：cache={}、batch_size=1、hotwords 列表、language、itn）。
+    Nano 不支持批量解码（model.py: batch decoding is not implemented），VAD 切出的段要一段一段送：
+    batch_size_s=1 让每批只装一段（每段都长于 1 秒）。"""
+    kw = {"input": [path], "cache": {}, "batch_size": 1, "batch_size_s": 1, "itn": True}
     if hot:
         kw["hotwords"] = hot.split()
     if lang in NANO_LANG:
