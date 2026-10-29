@@ -4,3 +4,5 @@ python-multipart>=0.0.9
 funasr>=1.2.0
 modelscope>=1.15
 transformers
+# FunASR 提取声学特征需要 torchaudio 或它；AutoDL 的 PyTorch 镜像不带 torchaudio
+kaldi-native-fbank
