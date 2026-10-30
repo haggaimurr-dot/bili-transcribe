@@ -1,7 +1,6 @@
 """任务队列与工作线程。"""
 import json
 import logging
-import queue
 import re
 import threading
 import time
@@ -91,9 +90,39 @@ class Progress:
                                    "percent": pct, "eta": eta, "message": message})
 
 
+class TaskQueue:
+    """等待队列：put 进来的任务 id，get 时按数据库里的 queue_order 取最靠前的一个（不是先进先出）。"""
+
+    def __init__(self):
+        self._ids: set[int] = set()
+        self._cond = threading.Condition()
+
+    def put(self, tid: int) -> None:
+        with self._cond:
+            self._ids.add(tid)
+            self._cond.notify()
+
+    def get(self) -> int:
+        with self._cond:
+            while True:
+                tid = db.next_queued(self._ids)
+                if tid is not None:
+                    self._ids.discard(tid)
+                    return tid
+                self._ids.clear()  # 剩下的都已取消或删除
+                self._cond.wait()
+
+    def qsize(self) -> int:
+        with self._cond:
+            return len(self._ids)
+
+
+MOVES = ("up", "down", "top", "bottom")
+
+
 class TaskManager:
     def __init__(self):
-        self.q: queue.Queue[int] = queue.Queue()
+        self.q = TaskQueue()
         self.cancels: dict[int, threading.Event] = {}
         self.current: int | None = None
         self.thread = threading.Thread(target=self._loop, name="task-worker", daemon=True)
@@ -141,6 +170,48 @@ class TaskManager:
         TaskLog(task_id)("收到取消请求")
         db.update_task(task_id, message=msg)
         self._emit(task_id)
+
+    def move(self, task_id: int, action: str) -> list[dict]:
+        """调整等待中任务的执行顺序：up/down 与相邻任务交换位置，top/bottom 移到最前/最后。返回新的等待队列。"""
+        if action not in MOVES:
+            raise AppError("BAD_REQUEST", f"不支持的操作 {action}", "可用：up / down / top / bottom")
+        with self.q._cond:  # 和 get() 互斥，避免工作线程正好在挑任务时顺序被改了一半
+            queued = db.queued_tasks()
+            idx = next((i for i, t in enumerate(queued) if t["id"] == task_id), None)
+            if idx is None:
+                t = db.get_task(task_id)
+                if not t:
+                    raise AppError("NOT_FOUND", "任务不存在", status=404)
+                raise AppError("NOT_QUEUED", "只有等待中的任务可以调整顺序", "这个任务已经开始或已经结束")
+            orders = [t["order"] for t in queued]
+            changes: list[tuple[int, float]] = []
+            if action in ("up", "down"):
+                j = idx - 1 if action == "up" else idx + 1
+                if 0 <= j < len(queued):
+                    a, b = queued[idx], queued[j]
+                    oa, ob = orders[idx], orders[j]
+                    if oa == ob:  # 排序值相同（理论上不会），先拉开再交换
+                        ob = oa + (1 if j > idx else -1)
+                    changes = [(a["id"], ob), (b["id"], oa)]
+            elif action == "top" and idx > 0:
+                changes = [(task_id, orders[0] - 1)]
+            elif action == "bottom" and idx < len(queued) - 1:
+                changes = [(task_id, orders[-1] + 1)]
+            if changes:
+                db.set_queue_order(changes)
+        if changes:
+            TaskLog(task_id)(f"调整等待顺序：{ {'up': '上移', 'down': '下移', 'top': '置顶', 'bottom': '置底'}[action] }")
+            for tid, _ in changes:
+                self._emit(tid)
+            bus.publish(task_id, {"type": "queue"})  # 全局 SSE 订阅者也会收到，用来刷新等待队列
+        return self.queue()
+
+    def queue(self) -> list[dict]:
+        """等待中的任务，按执行顺序，带 position（1 开始）。"""
+        items = db.queued_tasks()
+        for i, t in enumerate(items, 1):
+            t["position"] = i
+        return items
 
     def retry(self, task_id: int, force_asr: bool | None = None) -> int:
         t = db.get_task(task_id)

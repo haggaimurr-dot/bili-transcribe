@@ -197,3 +197,12 @@ td.title { max-width: 360px; overflow: hidden; text-overflow: ellipsis; white-sp
   :root:not([data-theme="light"]) .chip.plat.bilibili { background: #13303b; color: #5cc8ee; }
   :root:not([data-theme="light"]) .chip.plat.youtube { background: #3a1d1d; color: #ff7b72; }
 }
+
+/* ---------- 等待队列 ---------- */
+.qnow, .qrow { display: flex; align-items: center; gap: 10px; padding: 8px 0; border-bottom: 1px solid var(--border); }
+.qrow:last-child { border-bottom: 0; }
+.qnow { margin-top: 10px; }
+.qnow .t, .qrow .t { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text); }
+.qpos { flex: none; width: 22px; height: 22px; border-radius: 50%; background: var(--panel-2); color: var(--text-2);
+  font-size: 12px; display: inline-flex; align-items: center; justify-content: center; font-variant-numeric: tabular-nums; }
+.qrow .acts { display: flex; gap: 4px; flex: none; }

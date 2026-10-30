@@ -133,6 +133,20 @@ def cancel_task(task_id: int):
     return {"ok": True}
 
 
+class MoveIn(BaseModel):
+    action: str  # up | down | top | bottom
+
+
+@router.post("/tasks/{task_id}/move")
+def move_task(task_id: int, body: MoveIn):
+    return {"queue": manager.move(task_id, body.action)}
+
+
+@router.get("/queue")
+def get_queue():
+    return {"current": manager.current, "queue": manager.queue()}
+
+
 class RetryIn(BaseModel):
     force_asr: bool | None = None
 

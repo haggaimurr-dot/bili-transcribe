@@ -61,6 +61,8 @@ const state = reactive({
   remote: { online: false, configured: false },
   login: null,
   tasks: {}, // id -> task（由全局 SSE 维护）
+  queue: [], // 等待中的任务，按执行顺序
+  currentTask: null, // 正在执行的任务 id
 });
 
 function parseRoute() {
@@ -75,13 +77,32 @@ function upsertTask(t) {
   state.tasks[t.id] = { ...(state.tasks[t.id] || {}), ...t };
 }
 
+// 等待队列：任务状态变化、调整顺序、删除时重新拉取（合并 300ms 内的多次变化）
+let queueTimer;
+async function refreshQueue() {
+  try {
+    const r = await api("/queue", { quiet: true });
+    state.queue = r.queue;
+    state.currentTask = r.current;
+  } catch {}
+}
+function refreshQueueSoon() {
+  clearTimeout(queueTimer);
+  queueTimer = setTimeout(refreshQueue, 300);
+}
+
 let globalEs;
 function connectGlobal() {
   globalEs = sse("/events", (ev) => {
-    if (ev.type === "task") upsertTask(ev.task);
-    else if (ev.type === "progress" && state.tasks[ev.id]) {
+    if (ev.type === "task") {
+      upsertTask(ev.task);
+      refreshQueueSoon();
+    } else if (ev.type === "progress" && state.tasks[ev.id]) {
       Object.assign(state.tasks[ev.id], { percent: ev.percent, eta: ev.eta, ...(ev.message != null ? { message: ev.message } : {}) });
-    } else if (ev.type === "deleted") delete state.tasks[ev.id];
+    } else if (ev.type === "deleted") {
+      delete state.tasks[ev.id];
+      refreshQueueSoon();
+    } else if (ev.type === "queue") refreshQueueSoon();
   });
   globalEs.onerror = () => {}; // 浏览器会自动重连
 }
@@ -175,7 +196,11 @@ const TaskItem = {
       if (!confirm("删除这条任务及其结果？")) return;
       await api(`/tasks/${props.task.id}`, { method: "DELETE" });
     };
-    return { STAGE, SOURCE, PLATFORM, platformOf, isActive, taskTitle, clock, cancel, retry, remove };
+    const queuePos = computed(() => {
+      const i = state.queue.findIndex((q) => q.id === props.task.id);
+      return i >= 0 ? i + 1 : null;
+    });
+    return { STAGE, SOURCE, PLATFORM, platformOf, isActive, taskTitle, clock, cancel, retry, remove, queuePos };
   },
   template: `
     <div class="task">
@@ -183,7 +208,7 @@ const TaskItem = {
         <a class="title" :href="'#/task/' + task.id" :title="taskTitle(task)">{{ taskTitle(task) }}</a>
         <div class="sub">
           <span class="chip plat" :class="platformOf(task)">{{ PLATFORM[platformOf(task)] }}</span>
-          <span class="chip" :class="{accent: isActive(task), err: task.status==='failed', sub: task.status==='done'}">{{ STAGE[task.status] || task.status }}</span>
+          <span class="chip" :class="{accent: isActive(task), err: task.status==='failed', sub: task.status==='done'}">{{ STAGE[task.status] || task.status }}{{ task.status === 'queued' && queuePos ? ' · 第 ' + queuePos + ' 位' : '' }}</span>
           <span v-if="task.source" class="chip">{{ SOURCE[task.source] }}</span>
           <span v-if="task.duration_ms">{{ clock(task.duration_ms) }}</span>
           <span v-if="isActive(task) && task.message">{{ task.message }}</span>
@@ -202,10 +227,56 @@ const TaskItem = {
     </div>`,
 };
 
+// ---------------- 组件：等待队列 ----------------
+
+const QueuePanel = {
+  setup() {
+    const busy = ref(false);
+    async function move(t, action) {
+      if (busy.value) return;
+      busy.value = true;
+      try {
+        const r = await api(`/tasks/${t.id}/move`, { method: "POST", body: { action } });
+        state.queue = r.queue;
+      } catch {
+        refreshQueue(); // 可能刚好开始执行了，以服务端为准
+      } finally {
+        busy.value = false;
+      }
+    }
+    const cancel = (t) => api(`/tasks/${t.id}/cancel`, { method: "POST" });
+    const current = computed(() => state.currentTask && state.tasks[state.currentTask]);
+    onMounted(refreshQueue);
+    return { state, busy, move, cancel, current, taskTitle, clock, PLATFORM, platformOf, STAGE };
+  },
+  template: `
+    <div class="card" v-if="state.queue.length">
+      <div class="row"><h2 class="grow" style="margin:0">等待队列（{{ state.queue.length }}）</h2>
+        <span class="muted">从上到下依次执行，可以调整先后</span></div>
+      <div class="qnow" v-if="current">
+        <span class="chip accent">执行中</span>
+        <a :href="'#/task/' + current.id" class="t">{{ taskTitle(current) }}</a>
+        <span class="muted">{{ STAGE[current.status] }}{{ current.percent ? ' · ' + Math.floor(current.percent) + '%' : '' }}</span>
+      </div>
+      <div class="qrow" v-for="(t, i) in state.queue" :key="t.id">
+        <span class="qpos">{{ i + 1 }}</span>
+        <span class="chip plat" :class="platformOf(t)">{{ PLATFORM[platformOf(t)] }}</span>
+        <a :href="'#/task/' + t.id" class="t" :title="taskTitle(t)">{{ taskTitle(t) }}</a>
+        <span class="muted hide-sm" v-if="t.duration_ms">{{ clock(t.duration_ms) }}</span>
+        <div class="acts">
+          <button class="btn sm" title="和上一个交换" :disabled="busy || i === 0" @click="move(t, 'up')">↑</button>
+          <button class="btn sm" title="和下一个交换" :disabled="busy || i === state.queue.length - 1" @click="move(t, 'down')">↓</button>
+          <button class="btn sm" title="移到最前，下一个执行" :disabled="busy || i === 0" @click="move(t, 'top')">置顶</button>
+          <button class="btn sm" @click="cancel(t)">取消</button>
+        </div>
+      </div>
+    </div>`,
+};
+
 // ---------------- 页面：提交 ----------------
 
 const Home = {
-  components: { TagInput, TaskItem },
+  components: { TagInput, TaskItem, QueuePanel },
   setup() {
     const text = ref("");
     const parsing = ref(false);
@@ -467,6 +538,8 @@ const Home = {
         </div>
       </template>
     </div>
+
+    <QueuePanel></QueuePanel>
 
     <div class="card">
       <div class="row"><h2 class="grow" style="margin:0">最近任务</h2><a href="#/history" class="muted">全部历史 →</a></div>

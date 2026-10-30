@@ -6,7 +6,8 @@ import time
 
 from .config import DB_PATH
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
+QUEUE_KEY = "COALESCE(queue_order, id)"  # 等待队列的排序键
 
 TASK_COLUMNS = [
     "id", "platform", "bvid", "part", "title", "part_title", "uploader", "duration_ms", "url",
@@ -56,12 +57,17 @@ def init() -> None:
                 c.execute("ALTER TABLE tasks ADD COLUMN platform TEXT")
             c.execute("UPDATE tasks SET platform = CASE WHEN bvid='LOCAL' THEN 'local' ELSE 'bilibili' END "
                       "WHERE platform IS NULL")
+        if ver < 3:
+            # v3：加 queue_order 列，等待中的任务按它从小到大执行；为空时按 id
+            cols = {r[1] for r in c.execute("PRAGMA table_info(tasks)")}
+            if "queue_order" not in cols:
+                c.execute("ALTER TABLE tasks ADD COLUMN queue_order REAL")
         if ver < SCHEMA_VERSION:
             c.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
         c.commit()
 
 
-def _row(r: sqlite3.Row | None) -> dict | None:
+def _row(r: sqlite3.Row | dict | None) -> dict | None:
     if r is None:
         return None
     d = dict(r)
@@ -140,6 +146,41 @@ def delete_task(task_id: int) -> None:
 def count_opts_containing(fragment: str) -> int:
     with _lock:
         return _db().execute("SELECT COUNT(*) FROM tasks WHERE instr(opts_json, ?) > 0", (fragment,)).fetchone()[0]
+
+
+def queued_tasks() -> list[dict]:
+    """等待中的任务，按执行顺序排列；每条带 order（实际排序值）。"""
+    with _lock:
+        rows = _db().execute(
+            f"SELECT *, {QUEUE_KEY} AS q_order FROM tasks WHERE status='queued' ORDER BY {QUEUE_KEY}, id"
+        ).fetchall()
+    out = []
+    for r in rows:
+        d = dict(r)
+        order = d.pop("q_order")
+        t = _row(d)
+        t["order"] = order
+        out.append(t)
+    return out
+
+
+def next_queued(candidates: set[int]) -> int | None:
+    """在给定的 id 里挑排序最靠前、且仍在等待中的任务。"""
+    if not candidates:
+        return None
+    ids = list(candidates)
+    with _lock:
+        r = _db().execute(
+            f"SELECT id FROM tasks WHERE status='queued' AND id IN ({','.join('?' * len(ids))}) "
+            f"ORDER BY {QUEUE_KEY}, id LIMIT 1", ids).fetchone()
+    return r[0] if r else None
+
+
+def set_queue_order(pairs: list[tuple[int, float]]) -> None:
+    with _lock:
+        c = _db()
+        c.executemany("UPDATE tasks SET queue_order=? WHERE id=?", [(o, i) for i, o in pairs])
+        c.commit()
 
 
 def mark_interrupted() -> int:
